@@ -243,6 +243,10 @@ int create_tsi(oneM2MPrimitive *o2pt, RTNode *parent_rtnode) {
         }
     }
 
+    // Serialize with concurrent creates/readers: shared-TS mutation + tree frees
+#if MONO_THREAD == 0
+    pthread_mutex_lock(&main_lock);
+#endif
     char *new_lt_final = get_local_time(0);
     if (cJSON_GetObjectItem(p_obj, "lt")) {
         cJSON_ReplaceItemInObject(p_obj, "lt", cJSON_CreateString(new_lt_final));
@@ -264,6 +268,9 @@ int create_tsi(oneM2MPrimitive *o2pt, RTNode *parent_rtnode) {
     }
 
     db_update_resource(p_obj, get_ri_rtnode(parent_rtnode), RT_TS);
+#if MONO_THREAD == 0
+    pthread_mutex_unlock(&main_lock);
+#endif
 
     o2pt->rsc = RSC_CREATED;
     make_response_body(o2pt, tsi_node);

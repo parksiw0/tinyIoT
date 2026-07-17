@@ -45,6 +45,12 @@
 // Select PostgreSQL Schema Type: PG_SCHEMA_VARCHAR or PG_SCHEMA_TEXT
 // #define PG_SCHEMA_TYPE PG_SCHEMA_VARCHAR
 #define PG_SCHEMA_TYPE PG_SCHEMA_TEXT
+
+// PostgreSQL connection pool
+// Keep PG_POOL_SIZE well below the server's max_connections
+#define PG_POOL_SIZE 20
+// Max wait for a free pooled connection; on timeout the request fails
+#define PG_POOL_TIMEOUT_MS 2000
 #endif
 
 // Security

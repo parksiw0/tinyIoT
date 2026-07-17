@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 #include <pthread.h>
 #include "onem2m.h"
 #include "dbmanager.h"
@@ -16,68 +17,172 @@
 // Forward declaration for compatibility
 typedef struct sqlite3_stmt sqlite3_stmt;
 
-// PostgreSQL connection and guard for multi-thread access
-static PGconn *pg_conn = NULL;
-static pthread_mutex_t pg_conn_lock;
-static pthread_mutexattr_t pg_conn_lock_attr;
-static int pg_lock_initialized = 0;
-static int pg_tx_depth = 0;
-static pthread_t pg_tx_owner;
-static int pg_tx_owner_valid = 0;
+// PostgreSQL connection pool for multi-thread access
+typedef struct
+{
+    PGconn *conn;
+    int in_use;
+} pg_slot_t;
+
+static pg_slot_t pool[PG_POOL_SIZE];
+static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pool_cond = PTHREAD_COND_INITIALIZER;
 static char pg_conninfo[256] = {0};
+
+// Lock order is always main_lock -> pool, never the reverse.
+extern pthread_mutex_t main_lock;
+
+// Per-thread state: pg_lock()/pg_unlock() pairs are ref-counted; the
+// outermost pair checks a connection out of / back into the pool.
+static __thread PGconn *thread_conn = NULL;
+static __thread int thread_slot = -1;
+static __thread int thread_ref = 0;
+static __thread int pg_tx_depth = 0;
+
+static PGconn *pool_checkout(void)
+{
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += PG_POOL_TIMEOUT_MS / 1000;
+    deadline.tv_nsec += (PG_POOL_TIMEOUT_MS % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L)
+    {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&pool_lock);
+    int idx = -1;
+    for (;;)
+    {
+        for (int i = 0; i < PG_POOL_SIZE; i++)
+        {
+            if (!pool[i].in_use)
+            {
+                idx = i;
+                break;
+            }
+        }
+        if (idx >= 0)
+            break;
+        if (pthread_cond_timedwait(&pool_cond, &pool_lock, &deadline) == ETIMEDOUT)
+        {
+            pthread_mutex_unlock(&pool_lock);
+            logger("DB", LOG_LEVEL_ERROR, "Connection pool exhausted (waited %d ms)", PG_POOL_TIMEOUT_MS);
+            return NULL;
+        }
+    }
+    pool[idx].in_use = 1;
+    PGconn *conn = pool[idx].conn;
+    pthread_mutex_unlock(&pool_lock);
+
+    // Health-check/repair outside pool_lock (slot is ours)
+    if (conn && PQstatus(conn) != CONNECTION_OK)
+        PQreset(conn);
+    if (conn && PQstatus(conn) != CONNECTION_OK)
+    {
+        PQfinish(conn);
+        conn = NULL;
+    }
+    if (conn && conn == pool[idx].conn)
+    {
+        // Common path: unchanged connection, slot is ours until checkin
+        thread_slot = idx;
+        return conn;
+    }
+    if (!conn)
+    {
+        conn = PQconnectdb(pg_conninfo);
+        if (PQstatus(conn) != CONNECTION_OK)
+        {
+            logger("DB", LOG_LEVEL_ERROR, "PostgreSQL connection failed: %s", PQerrorMessage(conn));
+            PQfinish(conn);
+            conn = NULL;
+        }
+    }
+
+    pthread_mutex_lock(&pool_lock);
+    pool[idx].conn = conn;
+    if (!conn)
+    {
+        pool[idx].in_use = 0;
+        pthread_cond_signal(&pool_cond);
+    }
+    pthread_mutex_unlock(&pool_lock);
+
+    if (conn)
+        thread_slot = idx;
+    return conn;
+}
+
+static void pool_checkin(PGconn *conn)
+{
+    int idx = thread_slot;
+    thread_slot = -1;
+    if (idx < 0)
+        return;
+
+    // The slot is still exclusively ours: repair outside pool_lock
+    if (PQstatus(conn) != CONNECTION_OK)
+    {
+        PQfinish(conn);
+        conn = NULL;
+    }
+    else if (PQtransactionStatus(conn) != PQTRANS_IDLE)
+    {
+        logger("DB", LOG_LEVEL_WARN, "Connection returned inside a transaction; rolling back");
+        PGresult *r = PQexec(conn, "ROLLBACK");
+        PQclear(r);
+        if (PQtransactionStatus(conn) != PQTRANS_IDLE)
+        {
+            PQfinish(conn);
+            conn = NULL;
+        }
+    }
+
+    pthread_mutex_lock(&pool_lock);
+    pool[idx].conn = conn; // NULL slot is reconnected lazily by checkout
+    pool[idx].in_use = 0;
+    pthread_cond_signal(&pool_cond);
+    pthread_mutex_unlock(&pool_lock);
+}
 
 static void pg_lock(void)
 {
-    if (pg_lock_initialized)
-        pthread_mutex_lock(&pg_conn_lock);
+    if (thread_ref++ == 0)
+        thread_conn = pool_checkout(); // may be NULL; callers handle it
 }
 
 static void pg_unlock(void)
 {
-    if (pg_lock_initialized)
-        pthread_mutex_unlock(&pg_conn_lock);
+    if (thread_ref <= 0)
+    {
+        logger("DB", LOG_LEVEL_ERROR, "pg_unlock without matching pg_lock");
+        thread_ref = 0;
+        return;
+    }
+    if (--thread_ref == 0 && thread_conn)
+    {
+        pool_checkin(thread_conn);
+        thread_conn = NULL;
+    }
 }
 
-// Get or create a PG connection (caller should hold lock if needed)
+// Returns the connection pinned to this thread by pg_lock()
 static PGconn *get_pg_conn(void)
 {
-    if (pg_conn && PQstatus(pg_conn) == CONNECTION_OK)
-    {
-        return pg_conn;
-    }
-
-    if (pg_conn)
-    {
-        PQfinish(pg_conn);
-        pg_conn = NULL;
-    }
-
-    pg_conn = PQconnectdb(pg_conninfo);
-    if (PQstatus(pg_conn) != CONNECTION_OK)
-    {
-        logger("DB", LOG_LEVEL_ERROR, "PostgreSQL connection failed: %s", PQerrorMessage(pg_conn));
-        PQfinish(pg_conn);
-        pg_conn = NULL;
-        return NULL;
-    }
-
-    return pg_conn;
+    return thread_conn;
 }
 
 int db_begin_tx()
 {
-    if (pg_tx_owner_valid && pthread_equal(pg_tx_owner, pthread_self())) {
+    if (pg_tx_depth > 0) {
+        // Nested transaction on the same thread
         pg_tx_depth++;
         return 1;
     }
 
     pg_lock();
-    if (pg_tx_depth != 0) {
-        logger("DB", LOG_LEVEL_ERROR, "Transaction owner mismatch");
-        pg_unlock();
-        return 0;
-    }
-
     PGconn *conn = get_pg_conn();
     if (!conn) {
         pg_unlock();
@@ -92,59 +197,56 @@ int db_begin_tx()
         return 0;
     }
     PQclear(res);
-    pg_tx_owner = pthread_self();
-    pg_tx_owner_valid = 1;
     pg_tx_depth = 1;
+    // The ref taken by pg_lock() stays held: it pins this thread's
+    // connection until db_commit_tx()/db_rollback_tx()
     return 1;
 }
 
 int db_commit_tx()
 {
-    if (!pg_tx_owner_valid || !pthread_equal(pg_tx_owner, pthread_self())) {
-        logger("DB", LOG_LEVEL_ERROR, "Commit without transaction ownership");
-        return 0;
-    }
     if (pg_tx_depth == 0) {
+        logger("DB", LOG_LEVEL_ERROR, "Commit without transaction");
         return 0;
     }
-    pg_tx_depth--;
-    if (pg_tx_depth == 0 && pg_conn) {
-        PGresult *res = PQexec(pg_conn, "COMMIT");
-        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-            logger("DB", LOG_LEVEL_ERROR, "Failed to commit transaction: %s", PQerrorMessage(pg_conn));
-            PQclear(res);
-            return 0;
-        }
-        PQclear(res);
-        pg_tx_owner_valid = 0;
-        pg_unlock();
+    if (--pg_tx_depth > 0) {
+        return 1;
     }
-    return 1;
+
+    PGconn *conn = get_pg_conn();
+    int ok = 0;
+    if (conn) {
+        PGresult *res = PQexec(conn, "COMMIT");
+        ok = (PQresultStatus(res) == PGRES_COMMAND_OK);
+        if (!ok)
+            logger("DB", LOG_LEVEL_ERROR, "Failed to commit transaction: %s", PQerrorMessage(conn));
+        PQclear(res);
+    }
+    // Release the pinned ref even on failure; pool_checkin repairs
+    // a connection left inside an aborted transaction
+    pg_unlock();
+    return ok;
 }
 
 int db_rollback_tx()
 {
-    if (!pg_tx_owner_valid || !pthread_equal(pg_tx_owner, pthread_self())) {
-        logger("DB", LOG_LEVEL_ERROR, "Rollback without transaction ownership");
-        return 0;
-    }
-    if (pg_tx_depth == 0 || !pg_conn) {
-        pg_tx_depth = 0;
-        pg_tx_owner_valid = 0;
-        pg_unlock();
+    if (pg_tx_depth == 0) {
+        logger("DB", LOG_LEVEL_ERROR, "Rollback without transaction");
         return 0;
     }
     pg_tx_depth = 0;
-    PGresult *res = PQexec(pg_conn, "ROLLBACK");
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        logger("DB", LOG_LEVEL_ERROR, "Failed to rollback transaction: %s", PQerrorMessage(pg_conn));
+
+    PGconn *conn = get_pg_conn();
+    int ok = 0;
+    if (conn) {
+        PGresult *res = PQexec(conn, "ROLLBACK");
+        ok = (PQresultStatus(res) == PGRES_COMMAND_OK);
+        if (!ok)
+            logger("DB", LOG_LEVEL_ERROR, "Failed to rollback transaction: %s", PQerrorMessage(conn));
         PQclear(res);
-        return 0;
     }
-    PQclear(res);
-    pg_tx_owner_valid = 0;
     pg_unlock();
-    return 1;
+    return ok;
 }
 
 extern cJSON *ATTRIBUTES;
@@ -431,23 +533,39 @@ static int create_table(const table_def_t *table_def)
 /* DB init */
 int init_dbp()
 {
-    if (!pg_lock_initialized) {
-        pthread_mutexattr_init(&pg_conn_lock_attr);
-        pthread_mutexattr_settype(&pg_conn_lock_attr, PTHREAD_MUTEX_RECURSIVE);
-        pthread_mutex_init(&pg_conn_lock, &pg_conn_lock_attr);
-        pg_lock_initialized = 1;
-    }
-
-    pg_lock();
-    snprintf(pg_conninfo, sizeof(pg_conninfo), "host=%s port=%d user=%s password=%s dbname=%s",
+    snprintf(pg_conninfo, sizeof(pg_conninfo),
+             "host=%s port=%d user=%s password=%s dbname=%s application_name=tinyiot connect_timeout=5",
              PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DBNAME);
 
+    // Eagerly fill the pool so misconfiguration fails at boot, not under load
+    int connected = 0;
+    pthread_mutex_lock(&pool_lock);
+    for (int i = 0; i < PG_POOL_SIZE; i++) {
+        pool[i].in_use = 0;
+        pool[i].conn = PQconnectdb(pg_conninfo);
+        if (PQstatus(pool[i].conn) != CONNECTION_OK) {
+            if (connected == 0)
+                logger("DB", LOG_LEVEL_ERROR, "PostgreSQL connection failed: %s", PQerrorMessage(pool[i].conn));
+            PQfinish(pool[i].conn);
+            pool[i].conn = NULL; // reconnected lazily by pool_checkout
+        } else {
+            connected++;
+        }
+    }
+    pthread_mutex_unlock(&pool_lock);
+
+    if (connected == 0)
+        return 0;
+    if (connected < PG_POOL_SIZE)
+        logger("DB", LOG_LEVEL_WARN, "Connection pool partially filled: %d/%d", connected, PG_POOL_SIZE);
+    logger("DB", LOG_LEVEL_INFO, "PostgreSQL connected successfully (pool size %d).", connected);
+
+    pg_lock();
     PGconn *conn = get_pg_conn();
     if (!conn) {
         pg_unlock();
         return 0;
     }
-    logger("DB", LOG_LEVEL_INFO, "PostgreSQL connected successfully.");
 
     // Begin transaction
     if (!execute_sql_with_error_handling("BEGIN", "Begin Transaction")) {
@@ -458,9 +576,8 @@ int init_dbp()
     // Create all tables
     for (size_t i = 0; i < TABLE_COUNT; i++) {
         if (!create_table(&table_definitions[i])) {
-            PQexec(conn, "ROLLBACK");
-            PQfinish(conn);
-            pg_conn = NULL;
+            PGresult *r = PQexec(conn, "ROLLBACK");
+            PQclear(r);
             pg_unlock();
             return 0;
         }
@@ -469,9 +586,8 @@ int init_dbp()
     // Create all indexes
     for (size_t i = 0; i < INDEX_COUNT; i++) {
         if (!create_index(&index_definitions[i])) {
-            PQexec(conn, "ROLLBACK");
-            PQfinish(conn);
-            pg_conn = NULL;
+            PGresult *r = PQexec(conn, "ROLLBACK");
+            PQclear(r);
             pg_unlock();
             return 0;
         }
@@ -479,9 +595,8 @@ int init_dbp()
 
     // Commit transaction
     if (!execute_sql_with_error_handling("COMMIT", "Commit Transaction")) {
-        PQexec(conn, "ROLLBACK");
-        PQfinish(conn);
-        pg_conn = NULL;
+        PGresult *r = PQexec(conn, "ROLLBACK");
+        PQclear(r);
         pg_unlock();
         return 0;
     }
@@ -492,12 +607,18 @@ int init_dbp()
 
 int close_dbp()
 {
-    pg_lock();
-    if (pg_conn) {
-        PQfinish(pg_conn);
-        pg_conn = NULL;
+    // trylock: called from the SIGINT handler, avoid self-deadlock if the
+    // interrupted thread already holds pool_lock (OS reclaims sockets anyway)
+    if (pthread_mutex_trylock(&pool_lock) != 0)
+        return 1;
+    for (int i = 0; i < PG_POOL_SIZE; i++) {
+        // Best effort on shutdown: skip in-use slots, their threads are dying with the process
+        if (pool[i].conn && !pool[i].in_use) {
+            PQfinish(pool[i].conn);
+            pool[i].conn = NULL;
+        }
     }
-    pg_unlock();
+    pthread_mutex_unlock(&pool_lock);
     return 1;
 }
 
@@ -809,6 +930,13 @@ int db_store_resource(cJSON *obj, char *uri)
     cJSON *specific_attr = cJSON_GetObjectItem(ATTRIBUTES, get_resource_key(ty));
     if (!specific_attr) {
         logger("DB", LOG_LEVEL_ERROR, "No specific attributes found for resource type %d", ty);
+        pg_unlock();
+        return -1;
+    }
+
+    // get_table_name returns NULL for unmapped types (TS/TSI): avoid strcat(NULL)
+    if (!get_table_name(ty)) {
+        logger("DB", LOG_LEVEL_ERROR, "No table mapping for resource type %d (unsupported on PostgreSQL backend)", ty);
         pg_unlock();
         return -1;
     }
@@ -1719,17 +1847,26 @@ cJSON *db_get_descendants(oneM2MPrimitive *o2pt, RTNode *target_node, bool is_di
 
     char *uri = target_node->uri;
 
-    /* Acquire pg_lock for the main queries */
+    // append_forbidden below walks the shared tree; hold main_lock (before pool)
+#if MONO_THREAD == 0
+    pthread_mutex_lock(&main_lock);
+#endif
     pg_lock();
     PGconn *conn = get_pg_conn();
     if (!conn) {
         pg_unlock();
+#if MONO_THREAD == 0
+        pthread_mutex_unlock(&main_lock);
+#endif
         return result;
     }
 
     char *esc_uri = pg_escape_string_value(uri);
     if (!esc_uri) {
         pg_unlock();
+#if MONO_THREAD == 0
+        pthread_mutex_unlock(&main_lock);
+#endif
         return result;
     }
     
@@ -1919,6 +2056,7 @@ cJSON *db_get_descendants(oneM2MPrimitive *o2pt, RTNode *target_node, bool is_di
                 logger("DB", LOG_LEVEL_ERROR, "desc detail JOIN failed: %s",
                        PQerrorMessage(conn));
                 PQclear(res);
+                goto cleanup;
             }
 
             // 결과를 일단 바로 배열로 넣어주고 계층화는 make_response_body 에서 처리.
@@ -1934,6 +2072,9 @@ cJSON *db_get_descendants(oneM2MPrimitive *o2pt, RTNode *target_node, bool is_di
 cleanup:
     free(esc_uri);
     pg_unlock();
+#if MONO_THREAD == 0
+    pthread_mutex_unlock(&main_lock);
+#endif
     return result;
 }
 
@@ -1952,10 +2093,17 @@ cJSON *db_get_filter_criteria(oneM2MPrimitive *o2pt)
     cJSON *fc = o2pt->fc;
     cJSON *pjson = NULL, *ptr = NULL;
     cJSON *json = cJSON_CreateArray();
+    // getNonDiscoverableAcp below walks the shared tree; hold main_lock (before pool)
+#if MONO_THREAD == 0
+    pthread_mutex_lock(&main_lock);
+#endif
     pg_lock();
     PGconn *conn = get_pg_conn();
     if (!conn) {
         pg_unlock();
+#if MONO_THREAD == 0
+        pthread_mutex_unlock(&main_lock);
+#endif
         return json;
     }
     int fo = cJSON_GetNumberValue(cJSON_GetObjectItem(fc, "fo"));
@@ -2160,6 +2308,9 @@ cJSON *db_get_filter_criteria(oneM2MPrimitive *o2pt)
         PQclear(res);
         free(escaped_uri);
         pg_unlock();
+#if MONO_THREAD == 0
+        pthread_mutex_unlock(&main_lock);
+#endif
         return json;
     }
 
@@ -2184,6 +2335,9 @@ cJSON *db_get_filter_criteria(oneM2MPrimitive *o2pt)
     PQclear(res);
     free(escaped_uri);
     pg_unlock();
+#if MONO_THREAD == 0
+    pthread_mutex_unlock(&main_lock);
+#endif
     return json;
 }
 
@@ -2309,10 +2463,19 @@ int db_store_fcnt_custom_attributes(const char *ri, cJSON *customAttrs)
         return 0;
     }
 
+    pg_lock();
+    PGconn *conn = get_pg_conn();
+    if (!conn) {
+        pg_unlock();
+        free(json_str);
+        return 0;
+    }
+
     char *escaped_json = pg_escape_string_value(json_str);
     free(json_str);
 
     if (!escaped_json) {
+        pg_unlock();
         return 0;
     }
 
@@ -2322,11 +2485,12 @@ int db_store_fcnt_custom_attributes(const char *ri, cJSON *customAttrs)
 
     logger("DB", LOG_LEVEL_DEBUG, "db_store_fcnt_custom_attributes SQL: %s", sql);
 
-    PGresult *res = PQexec(pg_conn, sql);
+    PGresult *res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        logger("DB", LOG_LEVEL_ERROR, "Failed to store FCNT custom attributes: %s", PQerrorMessage(pg_conn));
+        logger("DB", LOG_LEVEL_ERROR, "Failed to store FCNT custom attributes: %s", PQerrorMessage(conn));
         PQclear(res);
         free(escaped_json);
+        pg_unlock();
         return 0;
     }
     PQclear(res);
@@ -2336,16 +2500,18 @@ int db_store_fcnt_custom_attributes(const char *ri, cJSON *customAttrs)
 
     logger("DB", LOG_LEVEL_DEBUG, "db_store_fcnt_custom_attributes SQL (FCIN): %s", sql);
 
-    res = PQexec(pg_conn, sql);
+    res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        logger("DB", LOG_LEVEL_ERROR, "Failed to store FCIN custom attributes: %s", PQerrorMessage(pg_conn));
+        logger("DB", LOG_LEVEL_ERROR, "Failed to store FCIN custom attributes: %s", PQerrorMessage(conn));
         PQclear(res);
         free(escaped_json);
+        pg_unlock();
         return 0;
     }
 
     PQclear(res);
     free(escaped_json);
+    pg_unlock();
     return 1;
 }
 
@@ -2365,27 +2531,38 @@ cJSON *db_get_fcnt_custom_attributes(const char *ri)
 
     logger("DB", LOG_LEVEL_DEBUG, "db_get_fcnt_custom_attributes SQL: %s", sql);
 
-    PGresult *res = PQexec(pg_conn, sql);
+    pg_lock();
+    PGconn *conn = get_pg_conn();
+    if (!conn) {
+        pg_unlock();
+        return NULL;
+    }
+
+    PGresult *res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        logger("DB", LOG_LEVEL_ERROR, "Failed to get FCNT/FCIN custom attributes: %s", PQerrorMessage(pg_conn));
+        logger("DB", LOG_LEVEL_ERROR, "Failed to get FCNT/FCIN custom attributes: %s", PQerrorMessage(conn));
         PQclear(res);
+        pg_unlock();
         return NULL;
     }
 
     int rows = PQntuples(res);
     if (rows == 0) {
         PQclear(res);
+        pg_unlock();
         return NULL;
     }
 
     char *json_str = PQgetvalue(res, 0, 0);
     if (!json_str || strlen(json_str) == 0 || strcmp(json_str, "null") == 0) {
         PQclear(res);
+        pg_unlock();
         return NULL;
     }
 
     cJSON *customAttrs = cJSON_Parse(json_str);
     PQclear(res);
+    pg_unlock();
 
     return customAttrs;
 }
@@ -2407,6 +2584,14 @@ int db_delete_one_fcin_mni(RTNode *fcnt)
     }
 
     char sql[512] = {0};
+
+    pg_lock();
+    PGconn *conn = get_pg_conn();
+    if (!conn) {
+        pg_unlock();
+        return -1;
+    }
+
     char *escaped_pi = pg_escape_string_value(pi);
 
     sprintf(sql, "SELECT general.id, fcin.cs FROM general "
@@ -2416,11 +2601,12 @@ int db_delete_one_fcin_mni(RTNode *fcnt)
 
     logger("DB", LOG_LEVEL_DEBUG, "SQL: %s", sql);
 
-    PGresult *res = PQexec(pg_conn, sql);
+    PGresult *res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        logger("DB", LOG_LEVEL_ERROR, "Failed to select oldest FCIN: %s", PQerrorMessage(pg_conn));
+        logger("DB", LOG_LEVEL_ERROR, "Failed to select oldest FCIN: %s", PQerrorMessage(conn));
         PQclear(res);
         free(escaped_pi);
+        pg_unlock();
         return -1;
     }
 
@@ -2428,6 +2614,7 @@ int db_delete_one_fcin_mni(RTNode *fcnt)
         logger("DB", LOG_LEVEL_ERROR, "No FCIN found to delete");
         PQclear(res);
         free(escaped_pi);
+        pg_unlock();
         return -1;
     }
 
@@ -2441,16 +2628,18 @@ int db_delete_one_fcin_mni(RTNode *fcnt)
     sprintf(sql, "DELETE FROM general WHERE id=%s", fcin_id_copy);
     logger("DB", LOG_LEVEL_DEBUG, "SQL: %s", sql);
 
-    res = PQexec(pg_conn, sql);
+    res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        logger("DB", LOG_LEVEL_ERROR, "Failed to delete oldest FCIN: %s", PQerrorMessage(pg_conn));
+        logger("DB", LOG_LEVEL_ERROR, "Failed to delete oldest FCIN: %s", PQerrorMessage(conn));
         PQclear(res);
         free(escaped_pi);
+        pg_unlock();
         return -1;
     }
 
     PQclear(res);
     free(escaped_pi);
+    pg_unlock();
     logger("DB", LOG_LEVEL_DEBUG, "Successfully deleted oldest FCIN with cs=%d", deleted_cs);
     return deleted_cs;
 }
@@ -2470,6 +2659,14 @@ int db_delete_one_fcin_mbs(RTNode *fcnt)
     }
 
     char sql[512] = {0};
+
+    pg_lock();
+    PGconn *conn = get_pg_conn();
+    if (!conn) {
+        pg_unlock();
+        return -1;
+    }
+
     char *escaped_pi = pg_escape_string_value(pi);
 
     sprintf(sql, "SELECT general.id, fcin.cs FROM general "
@@ -2479,11 +2676,12 @@ int db_delete_one_fcin_mbs(RTNode *fcnt)
 
     logger("DB", LOG_LEVEL_DEBUG, "SQL: %s", sql);
 
-    PGresult *res = PQexec(pg_conn, sql);
+    PGresult *res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        logger("DB", LOG_LEVEL_ERROR, "Failed to select oldest FCIN: %s", PQerrorMessage(pg_conn));
+        logger("DB", LOG_LEVEL_ERROR, "Failed to select oldest FCIN: %s", PQerrorMessage(conn));
         PQclear(res);
         free(escaped_pi);
+        pg_unlock();
         return -1;
     }
 
@@ -2491,6 +2689,7 @@ int db_delete_one_fcin_mbs(RTNode *fcnt)
         logger("DB", LOG_LEVEL_ERROR, "No FCIN found to delete");
         PQclear(res);
         free(escaped_pi);
+        pg_unlock();
         return -1;
     }
 
@@ -2504,16 +2703,18 @@ int db_delete_one_fcin_mbs(RTNode *fcnt)
     sprintf(sql, "DELETE FROM general WHERE id=%s", fcin_id_copy);
     logger("DB", LOG_LEVEL_DEBUG, "SQL: %s", sql);
 
-    res = PQexec(pg_conn, sql);
+    res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        logger("DB", LOG_LEVEL_ERROR, "Failed to delete oldest FCIN: %s", PQerrorMessage(pg_conn));
+        logger("DB", LOG_LEVEL_ERROR, "Failed to delete oldest FCIN: %s", PQerrorMessage(conn));
         PQclear(res);
         free(escaped_pi);
+        pg_unlock();
         return -1;
     }
 
     PQclear(res);
     free(escaped_pi);
+    pg_unlock();
     logger("DB", LOG_LEVEL_DEBUG, "Successfully deleted oldest FCIN with cs=%d", deleted_cs);
     return deleted_cs;
 }
@@ -2530,6 +2731,14 @@ int db_get_fcin_cbs_cni(RTNode *fcnt, int *out_cbs, int *out_cni)
     }
 
     char sql[512] = {0};
+
+    pg_lock();
+    PGconn *conn = get_pg_conn();
+    if (!conn) {
+        pg_unlock();
+        return -1;
+    }
+
     char *escaped_pi = pg_escape_string_value(pi);
 
     sprintf(sql, "SELECT COUNT(*), COALESCE(SUM(fcin.cs), 0) FROM general "
@@ -2538,11 +2747,12 @@ int db_get_fcin_cbs_cni(RTNode *fcnt, int *out_cbs, int *out_cni)
 
     logger("DB", LOG_LEVEL_DEBUG, "SQL: %s", sql);
 
-    PGresult *res = PQexec(pg_conn, sql);
+    PGresult *res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        logger("DB", LOG_LEVEL_ERROR, "Failed to get FCIN count/sum: %s", PQerrorMessage(pg_conn));
+        logger("DB", LOG_LEVEL_ERROR, "Failed to get FCIN count/sum: %s", PQerrorMessage(conn));
         PQclear(res);
         free(escaped_pi);
+        pg_unlock();
         return -1;
     }
 
@@ -2551,11 +2761,13 @@ int db_get_fcin_cbs_cni(RTNode *fcnt, int *out_cbs, int *out_cni)
         *out_cbs = atoi(PQgetvalue(res, 0, 1));
         PQclear(res);
         free(escaped_pi);
+        pg_unlock();
         logger("DB", LOG_LEVEL_DEBUG, "db_get_fcin_cbs_cni: cni=%d, cbs=%d", *out_cni, *out_cbs);
         return 0;
     } else {
         PQclear(res);
         free(escaped_pi);
+        pg_unlock();
         logger("DB", LOG_LEVEL_ERROR, "Failed to get FCIN count/sum");
         return -1;
     }
@@ -2578,16 +2790,24 @@ RTNode *db_get_fcin_rtnode_list(RTNode *rtnode)
         return NULL;
     }
 
+    pg_lock();
+    PGconn *conn = get_pg_conn();
+    if (!conn) {
+        pg_unlock();
+        return NULL;
+    }
+
     char *escaped_pi = pg_escape_string_value(pi);
     sprintf(sql, "SELECT * FROM general, fcin WHERE general.pi='%s' AND general.ty=58 AND general.id = fcin.id ORDER BY fcin.st ASC;", escaped_pi);
 
     logger("DB", LOG_LEVEL_DEBUG, "SQL: %s", sql);
 
-    PGresult *res = PQexec(pg_conn, sql);
+    PGresult *res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        logger("DB", LOG_LEVEL_ERROR, "Failed select: %s", PQerrorMessage(pg_conn));
+        logger("DB", LOG_LEVEL_ERROR, "Failed select: %s", PQerrorMessage(conn));
         PQclear(res);
         free(escaped_pi);
+        pg_unlock();
         return NULL;
     }
 
@@ -2596,6 +2816,7 @@ RTNode *db_get_fcin_rtnode_list(RTNode *rtnode)
         logger("DB", LOG_LEVEL_DEBUG, "No FCIN found for parent: %s", pi);
         PQclear(res);
         free(escaped_pi);
+        pg_unlock();
         return NULL;
     }
 
@@ -2644,6 +2865,7 @@ RTNode *db_get_fcin_rtnode_list(RTNode *rtnode)
 
     PQclear(res);
     free(escaped_pi);
+    pg_unlock();
     return head;
 }
 
@@ -2680,16 +2902,24 @@ cJSON *db_get_fcin_laol(RTNode *parent_rtnode, int laol)
         return NULL;
     }
 
+    pg_lock();
+    PGconn *conn = get_pg_conn();
+    if (!conn) {
+        pg_unlock();
+        return NULL;
+    }
+
     char *escaped_pi = pg_escape_string_value(parent_ri);
     sprintf(sql, "SELECT * FROM general, fcin WHERE general.pi='%s' AND general.ty=58 AND general.id = fcin.id ORDER BY fcin.st %s LIMIT 1;", escaped_pi, ord);
 
     logger("DB", LOG_LEVEL_DEBUG, "SQL: %s", sql);
 
-    res = PQexec(pg_conn, sql);
+    res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        logger("DB", LOG_LEVEL_ERROR, "Failed select: %s", PQerrorMessage(pg_conn));
+        logger("DB", LOG_LEVEL_ERROR, "Failed select: %s", PQerrorMessage(conn));
         PQclear(res);
         free(escaped_pi);
+        pg_unlock();
         return NULL;
     }
 
@@ -2697,6 +2927,7 @@ cJSON *db_get_fcin_laol(RTNode *parent_rtnode, int laol)
         logger("DB", LOG_LEVEL_DEBUG, "No FCIN found for parent: %s", parent_ri);
         PQclear(res);
         free(escaped_pi);
+        pg_unlock();
         return NULL;
     }
 
@@ -2736,6 +2967,7 @@ cJSON *db_get_fcin_laol(RTNode *parent_rtnode, int laol)
 
     PQclear(res);
     free(escaped_pi);
+    pg_unlock();
 
     cJSON *ri_obj = cJSON_GetObjectItem(json, "ri");
     logger("DB", LOG_LEVEL_DEBUG, "db_get_fcin_laol: ri_obj = %s", ri_obj ? (cJSON_IsString(ri_obj) ? ri_obj->valuestring : "NOT_STRING") : "NULL");

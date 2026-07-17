@@ -7,6 +7,7 @@
 
 extern ResourceTree *rt;
 extern cJSON *ATTRIBUTES;
+extern pthread_mutex_t main_lock;
 
 int create_cnt(oneM2MPrimitive *o2pt, RTNode *parent_rtnode)
 {
@@ -213,11 +214,18 @@ int update_cnt(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
 
     cJSON_AddItemToObject(m2m_cnt, "lt", cJSON_CreateString(get_local_time(0)));
 
+    // Serialize with create_cin: shared-CNT mutation + tree-node frees below
+#if MONO_THREAD == 0
+    pthread_mutex_lock(&main_lock);
+#endif
     update_resource(target_rtnode->obj, m2m_cnt);
 
     delete_cin_under_cnt_mni_mbs(target_rtnode);
 
     result = db_update_resource(m2m_cnt, cJSON_GetObjectItem(target_rtnode->obj, "ri")->valuestring, RT_CNT);
+#if MONO_THREAD == 0
+    pthread_mutex_unlock(&main_lock);
+#endif
 
     for (int i = 0; i < updateAttrCnt; i++)
     {

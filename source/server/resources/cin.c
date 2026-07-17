@@ -9,6 +9,7 @@
 
 extern ResourceTree *rt;
 extern cJSON *ATTRIBUTES;
+extern pthread_mutex_t main_lock;
 
 int create_cin(oneM2MPrimitive *o2pt, RTNode *parent_rtnode)
 {
@@ -97,8 +98,16 @@ int create_cin(oneM2MPrimitive *o2pt, RTNode *parent_rtnode)
 #endif
 
     RTNode *cin_rtnode = create_rtnode(cin, RT_CIN);
+
+    // Serialize the tx + shared-CNT-counter mutation + tree swap below
+#if MONO_THREAD == 0
+    pthread_mutex_lock(&main_lock);
+#endif
     if (!db_begin_tx())
     {
+#if MONO_THREAD == 0
+        pthread_mutex_unlock(&main_lock);
+#endif
         handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "DB begin fail");
         free_rtnode(cin_rtnode);
         cJSON_Delete(root);
@@ -107,6 +116,9 @@ int create_cin(oneM2MPrimitive *o2pt, RTNode *parent_rtnode)
     if (update_cnt_cin(parent_rtnode, cin_rtnode, 1) != 0)
     {
         db_rollback_tx();
+#if MONO_THREAD == 0
+        pthread_mutex_unlock(&main_lock);
+#endif
         handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "CNT update fail");
         free_rtnode(cin_rtnode);
         cJSON_Delete(root);
@@ -126,6 +138,9 @@ int create_cin(oneM2MPrimitive *o2pt, RTNode *parent_rtnode)
     if (result != 1)
     {
         db_rollback_tx();
+#if MONO_THREAD == 0
+        pthread_mutex_unlock(&main_lock);
+#endif
         handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "DB store fail");
         free_rtnode(cin_rtnode);
         cJSON_Delete(root);
@@ -133,12 +148,15 @@ int create_cin(oneM2MPrimitive *o2pt, RTNode *parent_rtnode)
     }
     if (!db_commit_tx())
     {
+#if MONO_THREAD == 0
+        pthread_mutex_unlock(&main_lock);
+#endif
         handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "DB commit fail");
         free_rtnode(cin_rtnode);
         cJSON_Delete(root);
         return o2pt->rsc;
     }
-
+    // still under main_lock: the "la" node swap below mutates the shared tree
     RTNode *rtnode = parent_rtnode->child;
     if (!rtnode)
     {
@@ -168,6 +186,9 @@ int create_cin(oneM2MPrimitive *o2pt, RTNode *parent_rtnode)
             free_rtnode(cin_rtnode);
         }
     }
+#if MONO_THREAD == 0
+    pthread_mutex_unlock(&main_lock);
+#endif
     cJSON_DetachItemFromObject(root, "m2m:cin");
     cJSON_Delete(root);
 
