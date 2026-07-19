@@ -24,6 +24,7 @@ int db_commit_tx();
 int db_rollback_tx();
 // Delete a resource by resource ID (ri). Used by TS/TSI deletion paths.
 int db_delete_resource(char *ri);
+int db_cnt_recount(char *cnt_ri, int *cni, long *cbs);
 
 // ---- TS / TSI helpers (keep resource logic out of TS/TSI modules) ----
 // TSI aggregates under a TS resource (identified by TS ri)

@@ -3731,3 +3731,37 @@ static int get_res_specific_fc_attrs(cJSON *fc, int *out_attrs) {
     }
     return count;
 }
+
+// boot-time recount of a CNT's counters from actual child CIN rows
+int db_cnt_recount(char *cnt_ri, int *cni, long *cbs)
+{
+    if (!cnt_ri || !cni || !cbs)
+        return 0;
+    char sql[512] = {0};
+    PGresult *res;
+    pg_lock();
+    PGconn *conn = get_pg_conn();
+    if (!conn)
+    {
+        pg_unlock();
+        return 0;
+    }
+    char *ri = pg_escape_string_value(cnt_ri);
+    sprintf(sql, "SELECT COUNT(*), COALESCE(SUM(c.cs),0) FROM general g "
+                 "JOIN cin c ON c.id = g.id WHERE g.pi='%s' AND g.ty=4;", ri);
+    res = PQexec(conn, sql);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK)
+    {
+        logger("DB", LOG_LEVEL_ERROR, "cnt recount failed: %s", PQerrorMessage(conn));
+        PQclear(res);
+        free(ri);
+        pg_unlock();
+        return 0;
+    }
+    *cni = atoi(PQgetvalue(res, 0, 0));
+    *cbs = atol(PQgetvalue(res, 0, 1));
+    PQclear(res);
+    free(ri);
+    pg_unlock();
+    return 1;
+}

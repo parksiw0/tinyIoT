@@ -778,6 +778,9 @@ void init_resource_tree()
 
     if (rtnode_list)
         restruct_resource_tree(rt->cb, rtnode_list);
+
+    if (CNT_FLUSH_MS > 0)
+        cnt_recount_boot(rt->cb->child);
 }
 
 RTNode *restruct_resource_tree(RTNode *parent_rtnode, RTNode *list)

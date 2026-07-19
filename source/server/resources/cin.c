@@ -99,26 +99,28 @@ int create_cin(oneM2MPrimitive *o2pt, RTNode *parent_rtnode)
 
     RTNode *cin_rtnode = create_rtnode(cin, RT_CIN);
 
-    // Serialize the tx + shared-CNT-counter mutation + tree swap below
-#if MONO_THREAD == 0
-    pthread_mutex_lock(&main_lock);
-#endif
-    if (!db_begin_tx())
+    // INSERT outside main_lock; failure leaves nothing to undo
+    char ptr[1024] = {0};
+    rn = cJSON_GetObjectItem(cin, "rn");
+    sprintf(ptr, "%s/%s", get_uri_rtnode(parent_rtnode), rn->valuestring);
+    if (db_store_resource(cin, ptr) != 1)
     {
-#if MONO_THREAD == 0
-        pthread_mutex_unlock(&main_lock);
-#endif
-        handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "DB begin fail");
+        handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "DB store fail");
         free_rtnode(cin_rtnode);
         cJSON_Delete(root);
         return o2pt->rsc;
     }
+
+    // in-memory counters + la swap only; CNT row is flushed in batches
+#if MONO_THREAD == 0
+    pthread_mutex_lock(&main_lock);
+#endif
     if (update_cnt_cin(parent_rtnode, cin_rtnode, 1) != 0)
     {
-        db_rollback_tx();
 #if MONO_THREAD == 0
         pthread_mutex_unlock(&main_lock);
 #endif
+        db_delete_onem2m_resource(cin_rtnode);
         handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "CNT update fail");
         free_rtnode(cin_rtnode);
         cJSON_Delete(root);
@@ -128,35 +130,6 @@ int create_cin(oneM2MPrimitive *o2pt, RTNode *parent_rtnode)
     make_response_body(o2pt, cin_rtnode);
     o2pt->rsc = RSC_CREATED;
 
-    // Add uri attribute
-    char ptr[1024] = {0};
-    rn = cJSON_GetObjectItem(cin, "rn");
-    sprintf(ptr, "%s/%s", get_uri_rtnode(parent_rtnode), rn->valuestring);
-
-    // Store to DB
-    int result = db_store_resource(cin, ptr);
-    if (result != 1)
-    {
-        db_rollback_tx();
-#if MONO_THREAD == 0
-        pthread_mutex_unlock(&main_lock);
-#endif
-        handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "DB store fail");
-        free_rtnode(cin_rtnode);
-        cJSON_Delete(root);
-        return o2pt->rsc;
-    }
-    if (!db_commit_tx())
-    {
-#if MONO_THREAD == 0
-        pthread_mutex_unlock(&main_lock);
-#endif
-        handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "DB commit fail");
-        free_rtnode(cin_rtnode);
-        cJSON_Delete(root);
-        return o2pt->rsc;
-    }
-    // still under main_lock: the "la" node swap below mutates the shared tree
     RTNode *rtnode = parent_rtnode->child;
     if (!rtnode)
     {

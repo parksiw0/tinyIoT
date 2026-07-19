@@ -53,6 +53,10 @@
 #define PG_POOL_TIMEOUT_MS 2000
 #endif
 
+// Batched CNT counter (cni/cbs/st) persistence interval in ms.
+// 0 = write the CNT row synchronously inside every CIN create (previous behavior).
+#define CNT_FLUSH_MS 100
+
 // Security
 
 // To disable ADMIN_AE_ID, comment the following line

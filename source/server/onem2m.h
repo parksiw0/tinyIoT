@@ -143,6 +143,10 @@ bool isResourceAptFC(oneM2MPrimitive *o2pt, RTNode *rtnode, cJSON *fc);
 int cJSON_getArrayIdx(cJSON *arr, char *value);
 int update_cnt_cin(RTNode *cnt_rtnode, RTNode *cin_rtnode, int sign);
 int update_fcnt_fcin(RTNode *fcnt_rtnode, RTNode *fcin_rtnode, int sign);
+void cnt_flush_mark(RTNode *cnt_rtnode);
+void cnt_flush_now(void);
+void *cnt_flush_worker(void *arg);
+void cnt_recount_boot(RTNode *node);
 
 // filter criteria
 int validate_filter_criteria(oneM2MPrimitive *o2pt);

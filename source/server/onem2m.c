@@ -33,6 +33,110 @@ static cJSON *build_arp_item(RTNode *node, int rcn, int drt);
 extern ResourceTree *rt;
 extern pthread_mutex_t main_lock;
 
+// Batched CNT counter persistence (CNT_FLUSH_MS): in-memory cni/cbs/st stay
+// authoritative; dirty CNT rows are persisted by cnt_flush_worker.
+#define CNT_DIRTY_MAX 128
+static char *cnt_dirty_uris[CNT_DIRTY_MAX];
+static int cnt_dirty_n = 0;
+static pthread_mutex_t cnt_dirty_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void cnt_flush_mark(RTNode *cnt_rtnode)   /* caller holds main_lock */
+{
+	char *uri = get_uri_rtnode(cnt_rtnode);
+	if (!uri)
+		return;
+	pthread_mutex_lock(&cnt_dirty_lock);
+	for (int i = 0; i < cnt_dirty_n; i++)
+	{
+		if (!strcmp(cnt_dirty_uris[i], uri))
+		{
+			pthread_mutex_unlock(&cnt_dirty_lock);
+			return;
+		}
+	}
+	if (cnt_dirty_n < CNT_DIRTY_MAX)
+		cnt_dirty_uris[cnt_dirty_n++] = strdup(uri);
+	pthread_mutex_unlock(&cnt_dirty_lock);
+}
+
+void cnt_flush_now(void)
+{
+	char *uris[CNT_DIRTY_MAX];
+	int n;
+	pthread_mutex_lock(&cnt_dirty_lock);
+	n = cnt_dirty_n;
+	if (n > 0)
+		memcpy(uris, cnt_dirty_uris, n * sizeof(char *));
+	cnt_dirty_n = 0;
+	pthread_mutex_unlock(&cnt_dirty_lock);
+	for (int i = 0; i < n; i++)
+	{
+		cJSON *dup = NULL;
+		char ri[256] = {0};
+		int ty = RT_CNT;
+		pthread_mutex_lock(&main_lock);
+		RTNode *node = find_rtnode(uris[i]);
+		if (node && node->obj)
+		{
+			dup = cJSON_Duplicate(node->obj, 1);
+			char *r = get_ri_rtnode(node);
+			if (r)
+				strncpy(ri, r, sizeof(ri) - 1);
+			ty = node->ty;
+		}
+		pthread_mutex_unlock(&main_lock);
+		if (dup && ri[0])
+			db_update_resource(dup, ri, ty);
+		if (dup)
+			cJSON_Delete(dup);
+		free(uris[i]);
+	}
+}
+
+void *cnt_flush_worker(void *arg)
+{
+	(void)arg;
+	if (CNT_FLUSH_MS <= 0)
+		return NULL;
+	struct timespec iv = {CNT_FLUSH_MS / 1000, (CNT_FLUSH_MS % 1000) * 1000000L};
+	while (1)
+	{
+		nanosleep(&iv, NULL);
+		cnt_flush_now();
+	}
+	return NULL;
+}
+
+// boot: cni/cbs may be stale by one flush interval after a crash — recount from rows
+void cnt_recount_boot(RTNode *node)
+{
+	for (; node; node = node->sibling_right)
+	{
+		if (node->ty == RT_CNT && node->obj)
+		{
+			int cni = 0;
+			long cbs = 0;
+			char *ri = get_ri_rtnode(node);
+			if (ri && db_cnt_recount(ri, &cni, &cbs))
+			{
+				cJSON *j;
+				if ((j = cJSON_GetObjectItem(node->obj, "cni")) && j->valueint != cni)
+				{
+					cJSON_SetIntValue(j, cni);
+					cnt_flush_mark(node);
+				}
+				if ((j = cJSON_GetObjectItem(node->obj, "cbs")) && j->valueint != (int)cbs)
+				{
+					cJSON_SetIntValue(j, (int)cbs);
+					cnt_flush_mark(node);
+				}
+			}
+		}
+		if (node->child)
+			cnt_recount_boot(node->child);
+	}
+}
+
 void init_cse(cJSON *cse)
 {
 	char *ct = get_local_time(0);
@@ -341,7 +445,10 @@ int update_cnt_cin(RTNode *cnt_rtnode, RTNode *cin_rtnode, int sign)
 	if (sign == 1)
 		delete_cin_under_cnt_mni_mbs(cnt_rtnode);
 
-	db_update_resource(cnt, get_ri_rtnode(cnt_rtnode), RT_CNT);
+	if (CNT_FLUSH_MS > 0)
+		cnt_flush_mark(cnt_rtnode);
+	else
+		db_update_resource(cnt, get_ri_rtnode(cnt_rtnode), RT_CNT);
 
 	return 0;
 }

@@ -220,6 +220,12 @@ int main(int argc, char **argv)
 	}
 #endif
 
+	if (CNT_FLUSH_MS > 0)
+	{
+		pthread_t cnt_flush;
+		pthread_create(&cnt_flush, NULL, cnt_flush_worker, NULL);
+	}
+
 	serve_forever(PORT); // main oneM2M operation logic in void route()
 
 #ifdef ENABLE_MQTT
@@ -448,6 +454,8 @@ void stop_server(int sig)
 		pthread_detach(coap);
 	}
 #endif
+	if (CNT_FLUSH_MS > 0)
+		cnt_flush_now();
 	logger("MAIN", LOG_LEVEL_INFO, "Closing DB...");
 	close_dbp();
 	logger("MAIN", LOG_LEVEL_INFO, "Cleaning ResourceTree...");
