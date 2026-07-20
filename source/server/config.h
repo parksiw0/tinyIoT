@@ -53,8 +53,7 @@
 #define PG_POOL_TIMEOUT_MS 2000
 #endif
 
-// Batched CNT counter (cni/cbs/st) persistence interval in ms.
-// 0 = write the CNT row synchronously inside every CIN create (previous behavior).
+// Interval for asynchronously persisting in-memory CNT cni/cbs/st counters (0 restores synchronous persistence).
 #define CNT_FLUSH_MS 100
 
 // Security

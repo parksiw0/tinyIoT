@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <stdarg.h>
+#include <pthread.h>
 
 #include "util.h"
 #include "logger.h"
@@ -10,6 +11,12 @@
 
 char *log_buffer;
 FILE *log_file;
+static pthread_mutex_t logger_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int logger_is_enabled(LOGLEVEL level)
+{
+    return level >= LOG_LEVEL;
+}
 
 /**
  * @brief Initialize logger
@@ -35,15 +42,16 @@ void logger_init()
  */
 void logger_free()
 {
+	pthread_mutex_lock(&logger_lock);
     free(log_buffer);
+    log_buffer = NULL;
 #ifdef SAVE_LOG
-    fclose(log_file);
+    if (log_file)
+        fclose(log_file);
+    log_file = NULL;
 #endif
+    pthread_mutex_unlock(&logger_lock);
 }
-
-#if MULTI_THREAD == 0
-bool writing = false;
-#endif
 
 /**
  * @brief Print log message to stderr
@@ -57,16 +65,9 @@ int logger(const char *tag, LOGLEVEL level, const char *msg, ...)
 {
 
     va_list ap;
-    char *t = NULL;
+    char t[26] = {0};
     char *llChar;
     int charsCnt = 0, fcolor = 0;
-#if MULTI_THREAD == 0
-    while (writing)
-    {
-        usleep(20);
-    }
-#endif
-    writing = true;
     switch (level)
     {
     case LOG_LEVEL_DEBUG:
@@ -98,23 +99,26 @@ int logger(const char *tag, LOGLEVEL level, const char *msg, ...)
         return 0;
     }
 
-    if (level >= LOG_LEVEL)
+    if (logger_is_enabled(level))
     {
+        pthread_mutex_lock(&logger_lock);
         time_t now;
         time(&now);
-        t = ctime(&now);
+        ctime_r(&now, t);
         t[24] = '\0';
         fprintf(stderr, "\r%s \033[0;%dm%-5s\033[0m [%s]: ", t, fcolor, llChar, tag);
 
         va_start(ap, msg);
-        charsCnt = vsnprintf(log_buffer, LOG_BUFFER_SIZE, msg, ap);
+        charsCnt = log_buffer ? vsnprintf(log_buffer, LOG_BUFFER_SIZE, msg, ap) : 0;
         va_end(ap);
-        fprintf(stderr, "%s\n", log_buffer);
+        if (log_buffer)
+            fprintf(stderr, "%s\n", log_buffer);
 
 #ifdef SAVE_LOG
-        fprintf(log_file, "\r%s %-5s [%s]: %s\n", t, llChar, tag, log_buffer);
+        if (log_file && log_buffer)
+            fprintf(log_file, "\r%s %-5s [%s]: %s\n", t, llChar, tag, log_buffer);
 #endif
+        pthread_mutex_unlock(&logger_lock);
     }
-    writing = false;
     return charsCnt;
 }

@@ -40,11 +40,14 @@ pthread_mutexattr_t Attr;
 
 void route(oneM2MPrimitive *o2pt);
 void stop_server(int sig);
+void shutdown_server(void);
 void log_runtime(double start);
 cJSON *ATTRIBUTES;
 char *PORT = SERVER_PORT;
-int terminate = 0;
+volatile sig_atomic_t terminate = 0;
 int call_stop = 0;
+static pthread_t cnt_flush_thread;
+static bool cnt_flush_started = false;
 
 #ifdef ENABLE_MQTT
 pthread_t mqtt;
@@ -84,6 +87,7 @@ int main(int argc, char **argv)
 {
 	bool initialBoot = false;
 	signal(SIGINT, stop_server);
+	signal(SIGTERM, stop_server);
 	logger_init();
 
 #if MONO_THREAD == 0
@@ -222,23 +226,18 @@ int main(int argc, char **argv)
 
 	if (CNT_FLUSH_MS > 0)
 	{
-		pthread_t cnt_flush;
-		pthread_create(&cnt_flush, NULL, cnt_flush_worker, NULL);
+		int rc = pthread_create(&cnt_flush_thread, NULL, cnt_flush_worker, NULL);
+		if (rc != 0)
+		{
+			logger("MAIN", LOG_LEVEL_ERROR, "CNT flush worker creation failed: %s", strerror(rc));
+			shutdown_server();
+			return 0;
+		}
+		cnt_flush_started = true;
 	}
 
 	serve_forever(PORT); // main oneM2M operation logic in void route()
-
-#ifdef ENABLE_MQTT
-	pthread_join(mqtt, NULL);
-	if (terminate)
-	{
-		return 0;
-	}
-#endif
-
-#ifdef ENABLE_COAP
-	pthread_join(coap, NULL);
-#endif
+	shutdown_server();
 
 	return 0;
 }
@@ -420,11 +419,18 @@ int handle_onem2m_request(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
 
 void stop_server(int sig)
 {
+	(void)sig;
+	terminate = 1;
+	int fd = listenfd;
+	listenfd = -1;
+	if (fd >= 0)
+		close(fd);
+}
+
+void shutdown_server(void)
+{
 	if (call_stop)
-	{
-		// logger("MAIN", LOG_LEVEL_WARN, "Server is already shutting down...");
 		return;
-	}
 	call_stop = 1;
 
 	logger("MAIN", LOG_LEVEL_INFO, "Shutting down server...");
@@ -454,6 +460,13 @@ void stop_server(int sig)
 		pthread_detach(coap);
 	}
 #endif
+	http_wait_for_workers();
+	if (cnt_flush_started)
+	{
+		cnt_flush_stop_worker();
+		pthread_join(cnt_flush_thread, NULL);
+		cnt_flush_started = false;
+	}
 	if (CNT_FLUSH_MS > 0)
 		cnt_flush_now();
 	logger("MAIN", LOG_LEVEL_INFO, "Closing DB...");
@@ -469,7 +482,6 @@ void stop_server(int sig)
 
 	logger("MAIN", LOG_LEVEL_INFO, "Done");
 	logger_free();
-	exit(0);
 }
 
 void log_runtime(double start)

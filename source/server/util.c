@@ -6,6 +6,11 @@
 #include <math.h>
 #include <ctype.h>
 #include <limits.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <unistd.h>
+#include <sys/random.h>
 #include <sys/timeb.h>
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
@@ -208,7 +213,9 @@ ResourceType coap_parse_object_type(int object_type)
 char* get_local_time(int diff)
 {
 	time_t t = time(NULL) - diff;
-	struct tm tm = *localtime(&t);
+	struct tm tm;
+	if (!localtime_r(&t, &tm))
+		memset(&tm, 0, sizeof(tm));
 	struct timespec specific_time;
 	clock_gettime(0, &specific_time);
 
@@ -388,7 +395,9 @@ ResourceType parse_object_type_cjson(cJSON* cjson)
 
 char* resource_identifier(ResourceType ty, char* ct)
 {
-	char* ri = (char*)calloc(32, sizeof(char));
+	char* ri = (char*)calloc(48, sizeof(char));
+	if (!ri)
+		return NULL;
 
 	switch (ty)
 	{
@@ -442,19 +451,41 @@ char* resource_identifier(ResourceType ty, char* ct)
 		break;
 	}
 
-	// struct timespec specific_time;
-	// int millsec;
-	static int n = 0;
+	// A Hosting CSE must keep resourceIDs unique across threads and restarts.
+	(void)ct;
+	unsigned char id[16];
+	size_t off = 0;
+	while (off < sizeof(id))
+	{
+		ssize_t n = getrandom(id + off, sizeof(id) - off, 0);
+		if (n > 0)
+		{
+			off += (size_t)n;
+			continue;
+		}
+		if (n < 0 && errno == EINTR)
+			continue;
+		break;
+	}
+	if (off != sizeof(id))
+	{
+		static atomic_uint_fast64_t fallback_seq = 0;
+		struct timespec ts;
+		clock_gettime(CLOCK_REALTIME, &ts);
+		uint64_t a = ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec;
+		uint64_t b = ((uint64_t)getpid() << 32) ^ atomic_fetch_add(&fallback_seq, 1);
+		memcpy(id, &a, sizeof(a));
+		memcpy(id + sizeof(a), &b, sizeof(b));
+	}
 
-	char buf[32] = "\0";
-
-	// clock_gettime(CLOCK_REALTIME, &specific_time);
-	// millsec = floor(specific_time.tv_nsec/1.0e6);
-
-	sprintf(buf, "%s%04d", ct, n);
-	n = (n + 1) % 10000;
-
-	strcat(ri, buf);
+	static const char hex[] = "0123456789abcdef";
+	size_t len = strlen(ri);
+	for (size_t i = 0; i < sizeof(id); i++)
+	{
+		ri[len++] = hex[id[i] >> 4];
+		ri[len++] = hex[id[i] & 0x0f];
+	}
+	ri[len] = '\0';
 
 	return ri;
 }
@@ -512,49 +543,35 @@ int delete_oldest_fcin_rtnode(RTNode *fcnt_rtnode)
 }
 
 
-void delete_cin_under_cnt_mni_mbs(RTNode *rtnode)
+int delete_cin_under_cnt_mni_mbs(RTNode *rtnode)
 {
 	logger("UTIL", LOG_LEVEL_DEBUG, "call delete_cin_under_cnt_mni_mbs");
+	if (!rtnode || !rtnode->obj)
+		return -1;
 	cJSON* cnt = rtnode->obj;
-	cJSON* cni_obj = NULL;
-	cJSON* cbs_obj = NULL;
-	cJSON* mni_obj = NULL;
-	cJSON* mbs_obj = NULL;
-	int cni, mni, cbs, mbs, tmp = 0;
+	cJSON* cni_obj = cJSON_GetObjectItem(cnt, "cni");
+	cJSON* cbs_obj = cJSON_GetObjectItem(cnt, "cbs");
+	cJSON* mni_obj = cJSON_GetObjectItem(cnt, "mni");
+	cJSON* mbs_obj = cJSON_GetObjectItem(cnt, "mbs");
+	if (!cJSON_IsNumber(cni_obj) || !cJSON_IsNumber(cbs_obj))
+		return -1;
 
-	if ((cni_obj = cJSON_GetObjectItem(cnt, "cni")))
-	{
-		cni = cni_obj->valueint;
-	}
-	if ((mni_obj = cJSON_GetObjectItem(cnt, "mni")))
-	{
-		mni = mni_obj->valueint;
-	}
-	else
-	{
-		mni = DEFAULT_MAX_NR_INSTANCES;
-	}
-	if ((cbs_obj = cJSON_GetObjectItem(cnt, "cbs")))
-	{
-		cbs = cbs_obj->valueint;
-	}
-	if ((mbs_obj = cJSON_GetObjectItem(cnt, "mbs")))
-	{
-		mbs = mbs_obj->valueint;
-	}
-	else
-	{
-		mbs = DEFAULT_MAX_BYTE_SIZE;
-	}
+	int cni = cni_obj->valueint;
+	int cbs = cbs_obj->valueint;
+	int mni = cJSON_IsNumber(mni_obj) ? mni_obj->valueint : DEFAULT_MAX_NR_INSTANCES;
+	int mbs = cJSON_IsNumber(mbs_obj) ? mbs_obj->valueint : DEFAULT_MAX_BYTE_SIZE;
+	int tmp = 0;
+
 	if (cni <= mni && cbs <= mbs)
-		return;
+		return 0;
 
 	if (cni == mni + 1)
 	{
 		tmp = db_delete_one_cin_mni(rtnode);
-		if (tmp == -1)
+		if (tmp < 0)
 		{
 			logger("UTIL", LOG_LEVEL_ERROR, "delete_cin_under_cnt_mni_mbs error");
+			return -1;
 		}
 		cbs -= tmp;
 		cni--;
@@ -564,13 +581,19 @@ void delete_cin_under_cnt_mni_mbs(RTNode *rtnode)
 	{
 		RTNode* head = db_get_cin_rtnode_list(rtnode);
 		RTNode* right;
+		if (!head)
+			return -1;
 
 		while ((mni >= 0 && cni > mni) || (mbs >= 0 && cbs > mbs))
 		{
 			if (head)
 			{
 				right = head->sibling_right;
-				db_delete_onem2m_resource(head);
+				if (db_delete_onem2m_resource(head) != 1)
+				{
+					free_rtnode_list(head);
+					return -1;
+				}
 				cbs -= cJSON_GetObjectItem(head->obj, "cs")->valueint;
 				cni--;
 				free_rtnode(head);
@@ -583,6 +606,8 @@ void delete_cin_under_cnt_mni_mbs(RTNode *rtnode)
 		}
 		if (head)
 			free_rtnode_list(head);
+		if (cni > mni || cbs > mbs)
+			return -1;
 	}
 
 	if (cni_obj->valueint != cni)
@@ -594,10 +619,7 @@ void delete_cin_under_cnt_mni_mbs(RTNode *rtnode)
 		cJSON_SetIntValue(cbs_obj, cbs);
 	}
 
-	cJSON* st = cJSON_GetObjectItem(rtnode->obj, "st");
-	cJSON_SetIntValue(st, st->valueint + 1);
-	db_update_resource(rtnode->obj, get_ri_rtnode(rtnode), RT_CNT);
-
+	return 0;
 }
 
 /**

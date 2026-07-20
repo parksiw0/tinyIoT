@@ -110,9 +110,13 @@ int create_cnt(oneM2MPrimitive *o2pt, RTNode *parent_rtnode)
     o2pt->rsc = RSC_CREATED;
 
     // Add uri attribute
-    char *ptr = malloc(1024);
+    char ptr[MAX_URI_SIZE + 1] = {0};
     cJSON *rn = cJSON_GetObjectItem(cnt, "rn");
-    sprintf(ptr, "%s/%s", get_uri_rtnode(parent_rtnode), rn->valuestring);
+    if (!rn || snprintf(ptr, sizeof(ptr), "%s/%s", get_uri_rtnode(parent_rtnode), rn->valuestring) >= (int)sizeof(ptr))
+    {
+        cJSON_Delete(root);
+        return handle_error(o2pt, RSC_BAD_REQUEST, "CNT URI is too long");
+    }
 
     // Store to DB
     int result = db_store_resource(cnt, ptr);
@@ -120,12 +124,8 @@ int create_cnt(oneM2MPrimitive *o2pt, RTNode *parent_rtnode)
     {
         handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "DB store fail");
         cJSON_Delete(root);
-        free(ptr);
-        ptr = NULL;
         return o2pt->rsc;
     }
-    free(ptr);
-    ptr = NULL;
 
     RTNode *child_rtnode = create_rtnode(cnt, RT_CNT);
     add_child_resource_tree(parent_rtnode, child_rtnode);
@@ -142,6 +142,14 @@ int update_cnt(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
     char invalid_key[][9] = {"ty", "pi", "ri", "rn", "ct", "cr"};
     cJSON *m2m_cnt = cJSON_GetObjectItem(o2pt->request_pc, "m2m:cnt");
     int invalid_key_size = sizeof(invalid_key) / (9 * sizeof(char));
+    char cnt_ri[64] = {0};
+    bool mutation_locked = false;
+    bool main_locked = false;
+    bool tx_active = false;
+    bool live_mutated = false;
+    int result = RSC_OK;
+    cJSON *cnt_snapshot_obj = NULL;
+    RTNode cnt_snapshot = {0};
 
     int updateAttrCnt = cJSON_GetArraySize(m2m_cnt);
 
@@ -154,8 +162,56 @@ int update_cnt(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
         }
     }
 
-    cJSON *cnt = target_rtnode->obj;
-    int result;
+#if MONO_THREAD == 0
+    pthread_mutex_lock(&main_lock);
+    main_locked = true;
+    target_rtnode = get_rtnode(o2pt);
+#endif
+    if (!target_rtnode || target_rtnode->ty != RT_CNT || !get_ri_rtnode(target_rtnode))
+    {
+#if MONO_THREAD == 0
+        pthread_mutex_unlock(&main_lock);
+        main_locked = false;
+#endif
+        return handle_error(o2pt, RSC_NOT_FOUND, "CNT no longer exists");
+    }
+    snprintf(cnt_ri, sizeof(cnt_ri), "%s", get_ri_rtnode(target_rtnode));
+#if MONO_THREAD == 0
+    pthread_mutex_unlock(&main_lock);
+    main_locked = false;
+#endif
+
+    cnt_mutation_lock(cnt_ri);
+    mutation_locked = true;
+#if MONO_THREAD == 0
+    pthread_mutex_lock(&main_lock);
+    main_locked = true;
+    target_rtnode = get_rtnode(o2pt);
+#endif
+    if (!target_rtnode || target_rtnode->ty != RT_CNT || !get_ri_rtnode(target_rtnode) ||
+        strcmp(cnt_ri, get_ri_rtnode(target_rtnode)) != 0)
+    {
+        result = handle_error(o2pt, RSC_NOT_FOUND, "CNT no longer exists");
+        goto cleanup;
+    }
+    cnt_snapshot_obj = cJSON_Duplicate(target_rtnode->obj, 1);
+    cnt_snapshot.uri = target_rtnode->uri ? strdup(target_rtnode->uri) : NULL;
+    if (!cnt_snapshot_obj || !cnt_snapshot.uri)
+    {
+        result = handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "Unable to snapshot CNT");
+        goto cleanup;
+    }
+    cnt_snapshot.obj = cnt_snapshot_obj;
+    cnt_snapshot.ty = RT_CNT;
+#if MONO_THREAD == 0
+    if (!cJSON_GetObjectItem(m2m_cnt, "at"))
+    {
+        pthread_mutex_unlock(&main_lock);
+        main_locked = false;
+    }
+#endif
+
+    cJSON *cnt = cnt_snapshot_obj;
     cJSON *pjson = NULL;
     cJSON *acpi_obj = NULL;
     bool acpi_flag = false;
@@ -183,7 +239,8 @@ int update_cnt(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
                 logger("UTIL", LOG_LEVEL_INFO, "acpi %s", acpi_obj->valuestring);
                 if (!has_acpi_update_privilege(o2pt, acpi_obj->valuestring))
                 {
-                    return handle_error(o2pt, RSC_ORIGINATOR_HAS_NO_PRIVILEGE, "no privilege to update acpi");
+                    result = handle_error(o2pt, RSC_ORIGINATOR_HAS_NO_PRIVILEGE, "no privilege to update acpi");
+                    goto cleanup;
                 }
             }
         }
@@ -193,13 +250,14 @@ int update_cnt(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
         {
             if (validate_acpi(o2pt, cJSON_GetObjectItem(m2m_cnt, "acpi"), ACOP_UPDATE) != RSC_OK)
             {
-                return handle_error(o2pt, RSC_BAD_REQUEST, "no privilege to update acpi");
+                result = handle_error(o2pt, RSC_BAD_REQUEST, "no privilege to update acpi");
+                goto cleanup;
             }
         }
     }
 
     if (result != RSC_OK)
-        return result;
+        goto cleanup;
 
     cJSON_AddNumberToObject(m2m_cnt, "st", cJSON_GetObjectItem(cnt, "st")->valueint + 1);
 
@@ -212,20 +270,58 @@ int update_cnt(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
         cJSON_AddItemToObject(m2m_cnt, "at", final_at);
     }
 
-    cJSON_AddItemToObject(m2m_cnt, "lt", cJSON_CreateString(get_local_time(0)));
+    char *lt = get_local_time(0);
+    cJSON_AddItemToObject(m2m_cnt, "lt", cJSON_CreateString(lt));
+    free(lt);
 
-    // Serialize with create_cin: shared-CNT mutation + tree-node frees below
 #if MONO_THREAD == 0
-    pthread_mutex_lock(&main_lock);
+    if (!main_locked)
+    {
+        pthread_mutex_lock(&main_lock);
+        main_locked = true;
+        target_rtnode = get_rtnode(o2pt);
+    }
 #endif
+    if (!target_rtnode || target_rtnode->ty != RT_CNT || !get_ri_rtnode(target_rtnode) ||
+        strcmp(cnt_ri, get_ri_rtnode(target_rtnode)) != 0)
+    {
+        result = handle_error(o2pt, RSC_NOT_FOUND, "CNT no longer exists");
+        goto cleanup;
+    }
+
+    if (!db_begin_tx())
+    {
+        result = handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "DB transaction start failed");
+        goto cleanup;
+    }
+    tx_active = true;
+
     update_resource(target_rtnode->obj, m2m_cnt);
+    live_mutated = true;
 
-    delete_cin_under_cnt_mni_mbs(target_rtnode);
+    if (delete_cin_under_cnt_mni_mbs(target_rtnode) != 0)
+    {
+        result = handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "CNT retention fail");
+        goto cleanup;
+    }
 
-    result = db_update_resource(m2m_cnt, cJSON_GetObjectItem(target_rtnode->obj, "ri")->valuestring, RT_CNT);
-#if MONO_THREAD == 0
-    pthread_mutex_unlock(&main_lock);
-#endif
+    // Persist the complete post-retention snapshot so cni/cbs and the policy
+    // update commit atomically with any CIN rows removed above.
+    result = db_update_resource(target_rtnode->obj,
+                                cJSON_GetObjectItem(target_rtnode->obj, "ri")->valuestring,
+                                RT_CNT);
+    if (result != 1)
+    {
+        result = handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "CNT persistence fail");
+        goto cleanup;
+    }
+    if (!db_commit_tx())
+    {
+        tx_active = false;
+        result = handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "DB commit fail");
+        goto cleanup;
+    }
+    tx_active = false;
 
     for (int i = 0; i < updateAttrCnt; i++)
     {
@@ -234,7 +330,37 @@ int update_cnt(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
 
     make_response_body(o2pt, target_rtnode);
     o2pt->rsc = RSC_UPDATED;
-    return RSC_UPDATED;
+    result = RSC_UPDATED;
+
+cleanup:
+    if (tx_active)
+    {
+        db_rollback_tx();
+        tx_active = false;
+    }
+    if (live_mutated && result != RSC_UPDATED && target_rtnode && cnt_snapshot_obj)
+    {
+        cJSON *restored = cJSON_Duplicate(cnt_snapshot_obj, 1);
+        if (restored)
+        {
+            cJSON_Delete(target_rtnode->obj);
+            target_rtnode->obj = restored;
+        }
+        else
+        {
+            logger("CNT", LOG_LEVEL_ERROR, "Unable to restore CNT after persistence failure");
+        }
+    }
+#if MONO_THREAD == 0
+    if (main_locked)
+        pthread_mutex_unlock(&main_lock);
+#endif
+    if (mutation_locked)
+        cnt_mutation_unlock(cnt_ri);
+    if (cnt_snapshot_obj)
+        cJSON_Delete(cnt_snapshot_obj);
+    free(cnt_snapshot.uri);
+    return result;
 }
 
 int validate_cnt(oneM2MPrimitive *o2pt, cJSON *cnt, Operation op)

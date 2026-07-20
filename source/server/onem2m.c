@@ -35,49 +35,113 @@ extern pthread_mutex_t main_lock;
 
 // Batched CNT counter persistence (CNT_FLUSH_MS): in-memory cni/cbs/st stay
 // authoritative; dirty CNT rows are persisted by cnt_flush_worker.
-#define CNT_DIRTY_MAX 128
-static char *cnt_dirty_uris[CNT_DIRTY_MAX];
-static int cnt_dirty_n = 0;
+static char **cnt_dirty_uris = NULL;
+static size_t cnt_dirty_n = 0;
+static size_t cnt_dirty_cap = 0;
 static pthread_mutex_t cnt_dirty_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t cnt_flush_run_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t cnt_worker_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cnt_worker_cond = PTHREAD_COND_INITIALIZER;
+static bool cnt_worker_stop = false;
 
-void cnt_flush_mark(RTNode *cnt_rtnode)   /* caller holds main_lock */
+#define CNT_MUTATION_LOCK_COUNT 64
+static pthread_mutex_t cnt_mutation_locks[CNT_MUTATION_LOCK_COUNT];
+static pthread_once_t cnt_mutation_once = PTHREAD_ONCE_INIT;
+
+static void cnt_mutation_init(void)
 {
-	char *uri = get_uri_rtnode(cnt_rtnode);
+	for (size_t i = 0; i < CNT_MUTATION_LOCK_COUNT; i++)
+		pthread_mutex_init(&cnt_mutation_locks[i], NULL);
+}
+
+static size_t cnt_mutation_index(const char *cnt_ri)
+{
+	uint64_t hash = 1469598103934665603ULL;
+	for (const unsigned char *p = (const unsigned char *)cnt_ri; p && *p; p++)
+	{
+		hash ^= *p;
+		hash *= 1099511628211ULL;
+	}
+	return (size_t)(hash % CNT_MUTATION_LOCK_COUNT);
+}
+
+void cnt_mutation_lock(const char *cnt_ri)
+{
+	pthread_once(&cnt_mutation_once, cnt_mutation_init);
+	pthread_mutex_lock(&cnt_mutation_locks[cnt_mutation_index(cnt_ri)]);
+}
+
+void cnt_mutation_unlock(const char *cnt_ri)
+{
+	pthread_mutex_unlock(&cnt_mutation_locks[cnt_mutation_index(cnt_ri)]);
+}
+
+// Takes ownership of uri. Duplicate dirty entries are coalesced.
+static int cnt_dirty_enqueue_owned(char *uri)
+{
 	if (!uri)
-		return;
+		return 0;
 	pthread_mutex_lock(&cnt_dirty_lock);
-	for (int i = 0; i < cnt_dirty_n; i++)
+	for (size_t i = 0; i < cnt_dirty_n; i++)
 	{
 		if (!strcmp(cnt_dirty_uris[i], uri))
 		{
 			pthread_mutex_unlock(&cnt_dirty_lock);
-			return;
+			free(uri);
+			return 1;
 		}
 	}
-	if (cnt_dirty_n < CNT_DIRTY_MAX)
-		cnt_dirty_uris[cnt_dirty_n++] = strdup(uri);
+	if (cnt_dirty_n == cnt_dirty_cap)
+	{
+		size_t new_cap = cnt_dirty_cap ? cnt_dirty_cap * 2 : 64;
+		char **new_uris = realloc(cnt_dirty_uris, new_cap * sizeof(*new_uris));
+		if (!new_uris)
+		{
+			pthread_mutex_unlock(&cnt_dirty_lock);
+			free(uri);
+			return 0;
+		}
+		cnt_dirty_uris = new_uris;
+		cnt_dirty_cap = new_cap;
+	}
+	cnt_dirty_uris[cnt_dirty_n++] = uri;
 	pthread_mutex_unlock(&cnt_dirty_lock);
+	return 1;
+}
+
+// The caller holds main_lock.
+void cnt_flush_mark(RTNode *cnt_rtnode)
+{
+	char *uri = get_uri_rtnode(cnt_rtnode);
+	if (!uri)
+		return;
+	if (!cnt_dirty_enqueue_owned(strdup(uri)))
+		logger("CNT", LOG_LEVEL_ERROR, "Unable to queue dirty CNT: %s", uri);
 }
 
 void cnt_flush_now(void)
 {
-	char *uris[CNT_DIRTY_MAX];
-	int n;
+	pthread_mutex_lock(&cnt_flush_run_lock);
+	char **uris;
+	size_t n;
 	pthread_mutex_lock(&cnt_dirty_lock);
+	uris = cnt_dirty_uris;
 	n = cnt_dirty_n;
-	if (n > 0)
-		memcpy(uris, cnt_dirty_uris, n * sizeof(char *));
+	cnt_dirty_uris = NULL;
 	cnt_dirty_n = 0;
+	cnt_dirty_cap = 0;
 	pthread_mutex_unlock(&cnt_dirty_lock);
-	for (int i = 0; i < n; i++)
+	for (size_t i = 0; i < n; i++)
 	{
 		cJSON *dup = NULL;
 		char ri[256] = {0};
 		int ty = RT_CNT;
+		bool exists = false;
 		pthread_mutex_lock(&main_lock);
 		RTNode *node = find_rtnode(uris[i]);
 		if (node && node->obj)
 		{
+			exists = true;
 			dup = cJSON_Duplicate(node->obj, 1);
 			char *r = get_ri_rtnode(node);
 			if (r)
@@ -85,12 +149,16 @@ void cnt_flush_now(void)
 			ty = node->ty;
 		}
 		pthread_mutex_unlock(&main_lock);
-		if (dup && ri[0])
-			db_update_resource(dup, ri, ty);
+		int persisted = dup && ri[0] && db_update_resource(dup, ri, ty) == 1;
 		if (dup)
 			cJSON_Delete(dup);
-		free(uris[i]);
+		if (persisted || !exists)
+			free(uris[i]);
+		else if (!cnt_dirty_enqueue_owned(uris[i]))
+			logger("CNT", LOG_LEVEL_ERROR, "Unable to requeue CNT after persistence failure");
 	}
+	free(uris);
+	pthread_mutex_unlock(&cnt_flush_run_lock);
 }
 
 void *cnt_flush_worker(void *arg)
@@ -98,13 +166,35 @@ void *cnt_flush_worker(void *arg)
 	(void)arg;
 	if (CNT_FLUSH_MS <= 0)
 		return NULL;
-	struct timespec iv = {CNT_FLUSH_MS / 1000, (CNT_FLUSH_MS % 1000) * 1000000L};
-	while (1)
+	pthread_mutex_lock(&cnt_worker_lock);
+	while (!cnt_worker_stop)
 	{
-		nanosleep(&iv, NULL);
+		struct timespec wake;
+		clock_gettime(CLOCK_REALTIME, &wake);
+		wake.tv_sec += CNT_FLUSH_MS / 1000;
+		wake.tv_nsec += (CNT_FLUSH_MS % 1000) * 1000000L;
+		if (wake.tv_nsec >= 1000000000L)
+		{
+			wake.tv_sec++;
+			wake.tv_nsec -= 1000000000L;
+		}
+		pthread_cond_timedwait(&cnt_worker_cond, &cnt_worker_lock, &wake);
+		if (cnt_worker_stop)
+			break;
+		pthread_mutex_unlock(&cnt_worker_lock);
 		cnt_flush_now();
+		pthread_mutex_lock(&cnt_worker_lock);
 	}
+	pthread_mutex_unlock(&cnt_worker_lock);
 	return NULL;
+}
+
+void cnt_flush_stop_worker(void)
+{
+	pthread_mutex_lock(&cnt_worker_lock);
+	cnt_worker_stop = true;
+	pthread_cond_broadcast(&cnt_worker_cond);
+	pthread_mutex_unlock(&cnt_worker_lock);
 }
 
 // boot: cni/cbs may be stale by one flush interval after a crash — recount from rows
@@ -116,8 +206,9 @@ void cnt_recount_boot(RTNode *node)
 		{
 			int cni = 0;
 			long cbs = 0;
+			int max_st = -1;
 			char *ri = get_ri_rtnode(node);
-			if (ri && db_cnt_recount(ri, &cni, &cbs))
+			if (ri && db_cnt_recount(ri, &cni, &cbs, &max_st))
 			{
 				cJSON *j;
 				if ((j = cJSON_GetObjectItem(node->obj, "cni")) && j->valueint != cni)
@@ -128,6 +219,11 @@ void cnt_recount_boot(RTNode *node)
 				if ((j = cJSON_GetObjectItem(node->obj, "cbs")) && j->valueint != (int)cbs)
 				{
 					cJSON_SetIntValue(j, (int)cbs);
+					cnt_flush_mark(node);
+				}
+				if ((j = cJSON_GetObjectItem(node->obj, "st")) && j->valueint < max_st)
+				{
+					cJSON_SetIntValue(j, max_st);
 					cnt_flush_mark(node);
 				}
 			}
@@ -305,7 +401,11 @@ void add_general_attribute(cJSON *root, RTNode *parent_rtnode, ResourceType ty)
 
 RTNode *create_rtnode(cJSON *obj, ResourceType ty)
 {
+	if (!obj)
+		return NULL;
 	RTNode *rtnode = (RTNode *)calloc(1, sizeof(RTNode));
+	if (!rtnode)
+		return NULL;
 	cJSON *uri = NULL;
 	cJSON *memberOf = NULL;
 	cJSON *pjson = NULL;
@@ -391,7 +491,7 @@ int update_cb(cJSON *csr, cJSON *cb)
  * @param sign 1 for create, -1 for delete
  * @return 0 for success, -1 for fail
  */
-int update_cnt_cin(RTNode *cnt_rtnode, RTNode *cin_rtnode, int sign)
+static int update_cnt_cin_internal(RTNode *cnt_rtnode, RTNode *cin_rtnode, int sign, bool persist)
 {
 	if (!cnt_rtnode || !cin_rtnode)
 		return -1;
@@ -402,7 +502,10 @@ int update_cnt_cin(RTNode *cnt_rtnode, RTNode *cin_rtnode, int sign)
 	cJSON *cni = cJSON_GetObjectItem(cnt, "cni");
 	cJSON *cbs = cJSON_GetObjectItem(cnt, "cbs");
 	cJSON *st = cJSON_GetObjectItem(cnt, "st");
+	cJSON *cin_cs = cJSON_GetObjectItem(cin, "cs");
 	cJSON *mia = cJSON_GetObjectItem(cnt, "mia");
+	if (!cni || !cbs || !st || !cin_cs)
+		return -1;
 
 	if (mia && mia->valueint > 0 && sign == 1) {
         time_t now = time(NULL);
@@ -438,19 +541,36 @@ int update_cnt_cin(RTNode *cnt_rtnode, RTNode *cin_rtnode, int sign)
     }
 
 	cJSON_SetIntValue(cni, cni->valueint + sign);
-	cJSON_SetIntValue(cbs, cbs->valueint + (sign * cJSON_GetObjectItem(cin, "cs")->valueint));
+	cJSON_SetIntValue(cbs, cbs->valueint + (sign * cin_cs->valueint));
+
 	cJSON_SetIntValue(st, st->valueint + 1);
+	if (sign == 1)
+	{
+		cJSON *cin_st = cJSON_GetObjectItem(cin, "st");
+		if (cin_st)
+			cJSON_SetIntValue(cin_st, st->valueint);
+	}
 	logger("O2", LOG_LEVEL_DEBUG, "cni: %d, cbs: %d, st: %d", cni->valueint, cbs->valueint, st->valueint);
 
-	if (sign == 1)
-		delete_cin_under_cnt_mni_mbs(cnt_rtnode);
-
-	if (CNT_FLUSH_MS > 0)
-		cnt_flush_mark(cnt_rtnode);
-	else
-		db_update_resource(cnt, get_ri_rtnode(cnt_rtnode), RT_CNT);
+	if (persist)
+	{
+		if (CNT_FLUSH_MS > 0)
+			cnt_flush_mark(cnt_rtnode);
+		else
+			db_update_resource(cnt, get_ri_rtnode(cnt_rtnode), RT_CNT);
+	}
 
 	return 0;
+}
+
+int update_cnt_cin(RTNode *cnt_rtnode, RTNode *cin_rtnode, int sign)
+{
+	return update_cnt_cin_internal(cnt_rtnode, cin_rtnode, sign, true);
+}
+
+int update_cnt_cin_memory(RTNode *cnt_rtnode, RTNode *cin_rtnode, int sign)
+{
+	return update_cnt_cin_internal(cnt_rtnode, cin_rtnode, sign, false);
 }
 
 int update_fcnt_fcin(RTNode *fcnt_rtnode, RTNode *fcin_rtnode, int sign)
@@ -480,13 +600,45 @@ int update_fcnt_fcin(RTNode *fcnt_rtnode, RTNode *fcin_rtnode, int sign)
 int delete_onem2m_resource(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
 {
 	logger("O2M", LOG_LEVEL_INFO, "Delete oneM2M resource");
+	char cnt_ri[64] = {0};
+	bool cnt_locked = false;
+#if MONO_THREAD == 0
+	pthread_mutex_lock(&main_lock);
+	RTNode *live_target = get_rtnode(o2pt);
+	if (live_target)
+		target_rtnode = live_target;
+	if (target_rtnode && target_rtnode->ty == RT_CNT)
+		snprintf(cnt_ri, sizeof(cnt_ri), "%s", get_ri_rtnode(target_rtnode));
+	else if (target_rtnode && target_rtnode->ty == RT_CIN && target_rtnode->parent)
+		snprintf(cnt_ri, sizeof(cnt_ri), "%s", get_ri_rtnode(target_rtnode->parent));
+	pthread_mutex_unlock(&main_lock);
+#endif
+	if (cnt_ri[0])
+	{
+		cnt_mutation_lock(cnt_ri);
+		cnt_locked = true;
+#if MONO_THREAD == 0
+		pthread_mutex_lock(&main_lock);
+		target_rtnode = get_rtnode(o2pt);
+		pthread_mutex_unlock(&main_lock);
+#endif
+		if (!target_rtnode)
+		{
+			cnt_mutation_unlock(cnt_ri);
+			return handle_error(o2pt, RSC_NOT_FOUND, "Resource no longer exists");
+		}
+	}
 	if (target_rtnode->ty == RT_CSE)
 	{
 		handle_error(o2pt, RSC_OPERATION_NOT_ALLOWED, "CSE can not be deleted");
+		if (cnt_locked)
+			cnt_mutation_unlock(cnt_ri);
 		return RSC_OPERATION_NOT_ALLOWED;
 	}
 	if (check_privilege(o2pt, target_rtnode, ACOP_DELETE) == -1)
 	{
+		if (cnt_locked)
+			cnt_mutation_unlock(cnt_ri);
 		return o2pt->rsc;
 	}
 	cJSON *root = NULL, *lim = NULL, *ofst = NULL, *lvl = NULL;
@@ -499,8 +651,66 @@ int delete_onem2m_resource(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
 #if MONO_THREAD == 0
 	pthread_mutex_lock(&main_lock);
 #endif
-	delete_process(o2pt, target_rtnode);
-	db_delete_onem2m_resource(target_rtnode);
+	cJSON *cnt_before_delete = NULL;
+	bool cin_tx_active = false;
+	if (target_rtnode->ty == RT_CIN && target_rtnode->parent && target_rtnode->parent->obj)
+	{
+		cnt_before_delete = cJSON_Duplicate(target_rtnode->parent->obj, 1);
+		if (!cnt_before_delete || !db_begin_tx())
+		{
+			cJSON_Delete(cnt_before_delete);
+#if MONO_THREAD == 0
+			pthread_mutex_unlock(&main_lock);
+#endif
+			if (cnt_locked)
+				cnt_mutation_unlock(cnt_ri);
+			return handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "Unable to start CIN delete transaction");
+		}
+		cin_tx_active = true;
+	}
+
+	// Do not mutate or free the in-memory tree unless the target row was
+	// successfully removed. CIN parent counters are committed in the same DB
+	// transaction so a crash cannot lose the deletion stateTag increment.
+	int db_deleted = db_delete_onem2m_resource(target_rtnode);
+	int processed = db_deleted == 1 ? delete_process(o2pt, target_rtnode) : 0;
+	int parent_persisted = 1;
+	if (processed == 1 && cin_tx_active)
+	{
+		parent_persisted = db_update_resource(target_rtnode->parent->obj,
+										 get_ri_rtnode(target_rtnode->parent), RT_CNT);
+	}
+	int cin_committed = 1;
+	if (db_deleted != 1 || processed != 1 || parent_persisted != 1)
+	{
+		if (cin_tx_active)
+			db_rollback_tx();
+		cin_tx_active = false;
+		cin_committed = 0;
+	}
+	else if (cin_tx_active)
+	{
+		cin_committed = db_commit_tx();
+		cin_tx_active = false;
+	}
+
+	if (!cin_committed)
+	{
+		if (cnt_before_delete && target_rtnode->parent)
+		{
+			cJSON_Delete(target_rtnode->parent->obj);
+			target_rtnode->parent->obj = cnt_before_delete;
+			cnt_before_delete = NULL;
+		}
+		cJSON_Delete(cnt_before_delete);
+#if MONO_THREAD == 0
+		pthread_mutex_unlock(&main_lock);
+#endif
+		if (cnt_locked)
+			cnt_mutation_unlock(cnt_ri);
+		return handle_error(o2pt, RSC_INTERNAL_SERVER_ERROR, "DB delete fail");
+	}
+	cJSON_Delete(cnt_before_delete);
 
 	if (target_rtnode->ty == RT_CIN)
 	{
@@ -550,6 +760,8 @@ int delete_onem2m_resource(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
 #if MONO_THREAD == 0
 	pthread_mutex_unlock(&main_lock);
 #endif
+	if (cnt_locked)
+		cnt_mutation_unlock(cnt_ri);
 
 	target_rtnode = NULL;
 	o2pt->rsc = RSC_DELETED;
@@ -582,7 +794,8 @@ int delete_process(oneM2MPrimitive *o2pt, RTNode *rtnode)
 	case RT_CNT:
 		break;
 	case RT_CIN:
-		update_cnt_cin(rtnode->parent, rtnode, -1);
+		if (update_cnt_cin(rtnode->parent, rtnode, -1) != 0)
+			return 0;
 		break;
 	case RT_FCNT:
 		break;
@@ -1651,8 +1864,6 @@ int notify_onem2m_resource(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
 static int sub_has_net(cJSON *subContainer, int event_net);
 int notify_via_sub(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
 {
-	logger("O2M", LOG_LEVEL_DEBUG, "Target OBJ = %s", target_rtnode && target_rtnode->obj ? cJSON_PrintUnformatted(target_rtnode->obj) : "(null)");
-	logger("O2M", LOG_LEVEL_DEBUG, "Notify via SUB [%s]", target_rtnode->uri);
 	cJSON *pjson = NULL;
 	NodeList *del = NULL;
 	NodeList *node = NULL;
@@ -1662,6 +1873,13 @@ int notify_via_sub(oneM2MPrimitive *o2pt, RTNode *target_rtnode)
 		logger("O2M", LOG_LEVEL_ERROR, "target_rtnode is NULL");
 		return -1;
 	}
+	if (logger_is_enabled(LOG_LEVEL_DEBUG))
+	{
+		char *target_json = target_rtnode->obj ? cJSON_PrintUnformatted(target_rtnode->obj) : NULL;
+		logger("O2M", LOG_LEVEL_DEBUG, "Target OBJ = %s", target_json ? target_json : "(null)");
+		free(target_json);
+	}
+	logger("O2M", LOG_LEVEL_DEBUG, "Notify via SUB [%s]", target_rtnode->uri ? target_rtnode->uri : "(null)");
 	if (o2pt->ty == RT_SUB && (o2pt->op == OP_CREATE || o2pt->op == OP_UPDATE))
 	{
 		logger("O2M", LOG_LEVEL_DEBUG, "skip sub notification");

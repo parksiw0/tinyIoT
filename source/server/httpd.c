@@ -17,16 +17,21 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #define MAX_CONNECTIONS 1024
 #define BUF_SIZE 65535
 #define QUEUE_SIZE 128
 
-int listenfd;
+int listenfd = -1;
 int clients[MAX_CONNECTIONS];
 static void start_server(const char *);
 static void respond(int);
 extern void route(oneM2MPrimitive *o2pt);
+extern volatile sig_atomic_t terminate;
+static pthread_mutex_t worker_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t worker_cond = PTHREAD_COND_INITIALIZER;
+static int active_workers = 0;
 
 static char *buf[MAX_CONNECTIONS];
 
@@ -38,14 +43,26 @@ void *respond_thread(void *ps)
     respond(slot);
     close(clients[slot]);
     clients[slot] = -1;
+    pthread_mutex_lock(&worker_lock);
+    active_workers--;
+    pthread_cond_broadcast(&worker_cond);
+    pthread_mutex_unlock(&worker_lock);
     pthread_detach(pthread_self());
     return NULL;
+}
+
+void http_wait_for_workers(void)
+{
+    pthread_mutex_lock(&worker_lock);
+    while (active_workers > 0)
+        pthread_cond_wait(&worker_cond, &worker_lock);
+    pthread_mutex_unlock(&worker_lock);
 }
 
 void serve_forever(const char *PORT)
 {
     struct sockaddr_in clientaddr;
-    socklen_t addrlen = 0;
+    socklen_t addrlen = sizeof(clientaddr);
 
     int slot = 0;
     int slots[MAX_CONNECTIONS];
@@ -64,20 +81,20 @@ void serve_forever(const char *PORT)
     struct timeval tv;
     tv.tv_sec = SOCKET_TIMEOUT;
     tv.tv_usec = 0;
-    while (1)
+    while (!terminate)
     {
         clients[slot] = accept(listenfd, (struct sockaddr *)&clientaddr, &addrlen);
-        setsockopt(clients[slot], IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
-        // set timeout for socket
-        setsockopt(clients[slot], SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
         if (clients[slot] < 0)
         {
-            perror("accept() error");
-            // exit(1);
             clients[slot] = -1;
+            if (!terminate && errno != EINTR)
+                perror("accept() error");
         }
         else
         {
+            setsockopt(clients[slot], IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+            // Set timeout for socket.
+            setsockopt(clients[slot], SOL_SOCKET, SO_RCVTIMEO, (char *)&tv, sizeof(tv));
             pthread_t thread_id;
             if (MONO_THREAD)
             {
@@ -87,10 +104,23 @@ void serve_forever(const char *PORT)
             }
             else
             {
-                pthread_create(&thread_id, NULL, respond_thread, (void *)&slots[slot]);
+                pthread_mutex_lock(&worker_lock);
+                active_workers++;
+                pthread_mutex_unlock(&worker_lock);
+                int rc = pthread_create(&thread_id, NULL, respond_thread, (void *)&slots[slot]);
+                if (rc != 0)
+                {
+                    logger("HTTP", LOG_LEVEL_ERROR, "Unable to create request worker: %s", strerror(rc));
+                    close(clients[slot]);
+                    clients[slot] = -1;
+                    pthread_mutex_lock(&worker_lock);
+                    active_workers--;
+                    pthread_cond_broadcast(&worker_cond);
+                    pthread_mutex_unlock(&worker_lock);
+                }
             }
         }
-        while (clients[slot] != -1)
+        while (!terminate && clients[slot] != -1)
             slot = (slot + 1) % MAX_CONNECTIONS;
     }
 }

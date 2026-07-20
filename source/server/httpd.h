@@ -50,6 +50,8 @@ typedef struct _host
 
 // Server control functions
 void serve_forever(const char* PORT);
+void http_wait_for_workers(void);
+extern int listenfd;
 char* search_header(header_t* h, const char* name);
 void set_header(char* key, char* value, char* response_headers);
 void normalize_payload(char* body);

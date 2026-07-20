@@ -18,6 +18,7 @@ RED = 31
 }COLOR;
 
 int logger(const char* tag,  LOGLEVEL level, const char *msg, ...);
+int logger_is_enabled(LOGLEVEL level);
 
 void logger_init();
 void logger_free();

@@ -135,7 +135,7 @@ int check_macp_privilege(oneM2MPrimitive* o2pt, RTNode* rtnode, ACOP acop);
 // etc
 char *get_local_time(int diff);
 char *resource_identifier(ResourceType ty, char *ct);
-void delete_cin_under_cnt_mni_mbs(RTNode *rtnode);
+int delete_cin_under_cnt_mni_mbs(RTNode *rtnode);
 int delete_oldest_fcin_rtnode(RTNode *fcnt_rtnode);
 int net_to_bit(cJSON *net);
 int get_value_querystring_int(char *key);

@@ -763,6 +763,7 @@ void init_resource_tree()
         while (tail->sibling_right)
         {
             tail = tail->sibling_right;
+            free(tail->rn);
             tail->rn = strdup("la");
         }
     }
@@ -777,7 +778,14 @@ void init_resource_tree()
     temp = rtnode_list;
 
     if (rtnode_list)
-        restruct_resource_tree(rt->cb, rtnode_list);
+    {
+        rtnode_list = restruct_resource_tree(rt->cb, rtnode_list);
+        if (rtnode_list)
+        {
+            logger("RTM", LOG_LEVEL_WARN, "Discarding database resources whose parents are missing");
+            free_rtnode_list(rtnode_list);
+        }
+    }
 
     if (CNT_FLUSH_MS > 0)
         cnt_recount_boot(rt->cb->child);
@@ -791,6 +799,21 @@ RTNode *restruct_resource_tree(RTNode *parent_rtnode, RTNode *list)
     {
         RTNode *right = rtnode->sibling_right;
         // logger("UTIL", LOG_LEVEL_DEBUG, "restruct_resource_tree : %s, pi %s", get_ri_rtnode(rtnode), get_pi_rtnode(rtnode));
+        // The CSEBase is created before this DB list is loaded, so discard its duplicate row node.
+        if (!strcmp(get_ri_rtnode(parent_rtnode), get_ri_rtnode(rtnode)))
+        {
+            RTNode *left = rtnode->sibling_left;
+            if (left)
+                left->sibling_right = right;
+            else
+                list = right;
+            if (right)
+                right->sibling_left = left;
+            rtnode->sibling_left = rtnode->sibling_right = NULL;
+            free_rtnode(rtnode);
+            rtnode = right;
+            continue;
+        }
         if (!strcmp(get_ri_rtnode(parent_rtnode), get_pi_rtnode(rtnode)))
         {
             RTNode *left = rtnode->sibling_left;

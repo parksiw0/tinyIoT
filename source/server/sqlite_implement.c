@@ -978,7 +978,8 @@ int db_delete_one_cin_mni(RTNode *cnt)
 
     if (sqlite3_step(res) != SQLITE_ROW)
     {
-        return 0;
+        sqlite3_finalize(res);
+        return -1;
     }
 
     latest_ri = sqlite3_column_text(res, 0);
@@ -1002,6 +1003,39 @@ int db_delete_one_cin_mni(RTNode *cnt)
     // }
     sqlite3_finalize(res);
     return latest_cs;
+}
+
+int db_cnt_recount(char *cnt_ri, int *cni, long *cbs, int *max_st)
+{
+    if (!cnt_ri || !cni || !cbs || !max_st)
+        return 0;
+
+    sqlite_lock();
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT COUNT(*), COALESCE(SUM(c.cs),0), COALESCE(MAX(c.st),-1) "
+                      "FROM general g JOIN cin c ON c.id=g.id WHERE g.pi=? AND g.ty=4;";
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK)
+    {
+        logger("DB", LOG_LEVEL_ERROR, "CNT recount prepare failed: %s", sqlite3_errmsg(db));
+        sqlite_unlock();
+        return 0;
+    }
+    sqlite3_bind_text(stmt, 1, cnt_ri, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW)
+    {
+        logger("DB", LOG_LEVEL_ERROR, "CNT recount failed: %s", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        sqlite_unlock();
+        return 0;
+    }
+    *cni = sqlite3_column_int(stmt, 0);
+    *cbs = (long)sqlite3_column_int64(stmt, 1);
+    *max_st = sqlite3_column_int(stmt, 2);
+    sqlite3_finalize(stmt);
+    sqlite_unlock();
+    return 1;
 }
 
 RTNode *db_get_all_resource_as_rtnode()

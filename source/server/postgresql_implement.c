@@ -28,6 +28,7 @@ static pg_slot_t pool[PG_POOL_SIZE];
 static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pool_cond = PTHREAD_COND_INITIALIZER;
 static char pg_conninfo[256] = {0};
+static int pool_closing = 0;
 
 // Lock order is always main_lock -> pool, never the reverse.
 extern pthread_mutex_t main_lock;
@@ -55,12 +56,30 @@ static PGconn *pool_checkout(void)
     int idx = -1;
     for (;;)
     {
+        if (pool_closing)
+        {
+            pthread_mutex_unlock(&pool_lock);
+            return NULL;
+        }
+        // Prefer an already connected slot so a partially filled pool does not
+        // fail a request while a healthy free connection is available.
         for (int i = 0; i < PG_POOL_SIZE; i++)
         {
-            if (!pool[i].in_use)
+            if (!pool[i].in_use && pool[i].conn && PQstatus(pool[i].conn) == CONNECTION_OK)
             {
                 idx = i;
                 break;
+            }
+        }
+        if (idx < 0)
+        {
+            for (int i = 0; i < PG_POOL_SIZE; i++)
+            {
+                if (!pool[i].in_use)
+                {
+                    idx = i;
+                    break;
+                }
             }
         }
         if (idx >= 0)
@@ -84,19 +103,21 @@ static PGconn *pool_checkout(void)
         PQfinish(conn);
         conn = NULL;
     }
-    if (conn && conn == pool[idx].conn)
+    if (conn)
     {
-        // Common path: unchanged connection, slot is ours until checkin
+        // The checked-out slot remains exclusively owned until checkin.
         thread_slot = idx;
         return conn;
     }
     if (!conn)
     {
         conn = PQconnectdb(pg_conninfo);
-        if (PQstatus(conn) != CONNECTION_OK)
+        if (!conn || PQstatus(conn) != CONNECTION_OK)
         {
-            logger("DB", LOG_LEVEL_ERROR, "PostgreSQL connection failed: %s", PQerrorMessage(conn));
-            PQfinish(conn);
+            logger("DB", LOG_LEVEL_ERROR, "PostgreSQL connection failed: %s",
+                   conn ? PQerrorMessage(conn) : "out of memory");
+            if (conn)
+                PQfinish(conn);
             conn = NULL;
         }
     }
@@ -492,8 +513,11 @@ typedef struct {
 } index_def_t;
 
 static const index_def_t index_definitions[] = {
+    {"uq_general_ri", "CREATE UNIQUE INDEX IF NOT EXISTS uq_general_ri ON general(ri);"},
+    {"uq_general_uri", "CREATE UNIQUE INDEX IF NOT EXISTS uq_general_uri ON general(uri);"},
+    {"uq_general_pi_rn", "CREATE UNIQUE INDEX IF NOT EXISTS uq_general_pi_rn ON general(pi, rn);"},
+    {"idx_general_pi_ty", "CREATE INDEX IF NOT EXISTS idx_general_pi_ty ON general(pi, ty);"},
     {"idx_cin_id", "CREATE INDEX IF NOT EXISTS idx_cin_id ON cin(id DESC);"},
-    // Add more indexes as needed for performance optimization
 };
 #define INDEX_COUNT (sizeof(index_definitions) / sizeof(index_def_t))
 /* Helper function to execute SQL and handle errors for PostgreSQL */
@@ -533,20 +557,26 @@ static int create_table(const table_def_t *table_def)
 /* DB init */
 int init_dbp()
 {
+    int connect_timeout_sec = (PG_POOL_TIMEOUT_MS + 999) / 1000;
+    if (connect_timeout_sec < 1)
+        connect_timeout_sec = 1;
     snprintf(pg_conninfo, sizeof(pg_conninfo),
-             "host=%s port=%d user=%s password=%s dbname=%s application_name=tinyiot connect_timeout=5",
-             PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DBNAME);
+             "host=%s port=%d user=%s password=%s dbname=%s application_name=tinyiot connect_timeout=%d",
+             PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DBNAME, connect_timeout_sec);
 
     // Eagerly fill the pool so misconfiguration fails at boot, not under load
     int connected = 0;
     pthread_mutex_lock(&pool_lock);
+    pool_closing = 0;
     for (int i = 0; i < PG_POOL_SIZE; i++) {
         pool[i].in_use = 0;
         pool[i].conn = PQconnectdb(pg_conninfo);
-        if (PQstatus(pool[i].conn) != CONNECTION_OK) {
+        if (!pool[i].conn || PQstatus(pool[i].conn) != CONNECTION_OK) {
             if (connected == 0)
-                logger("DB", LOG_LEVEL_ERROR, "PostgreSQL connection failed: %s", PQerrorMessage(pool[i].conn));
-            PQfinish(pool[i].conn);
+                logger("DB", LOG_LEVEL_ERROR, "PostgreSQL connection failed: %s",
+                       pool[i].conn ? PQerrorMessage(pool[i].conn) : "out of memory");
+            if (pool[i].conn)
+                PQfinish(pool[i].conn);
             pool[i].conn = NULL; // reconnected lazily by pool_checkout
         } else {
             connected++;
@@ -607,16 +637,23 @@ int init_dbp()
 
 int close_dbp()
 {
-    // trylock: called from the SIGINT handler, avoid self-deadlock if the
-    // interrupted thread already holds pool_lock (OS reclaims sockets anyway)
-    if (pthread_mutex_trylock(&pool_lock) != 0)
-        return 1;
+    pthread_mutex_lock(&pool_lock);
+    pool_closing = 1;
+    pthread_cond_broadcast(&pool_cond);
+    for (;;) {
+        int active = 0;
+        for (int i = 0; i < PG_POOL_SIZE; i++)
+            active += pool[i].in_use != 0;
+        if (active == 0)
+            break;
+        pthread_cond_wait(&pool_cond, &pool_lock);
+    }
     for (int i = 0; i < PG_POOL_SIZE; i++) {
-        // Best effort on shutdown: skip in-use slots, their threads are dying with the process
-        if (pool[i].conn && !pool[i].in_use) {
+        if (pool[i].conn) {
             PQfinish(pool[i].conn);
             pool[i].conn = NULL;
         }
+        pool[i].in_use = 0;
     }
     pthread_mutex_unlock(&pool_lock);
     return 1;
@@ -867,7 +904,15 @@ static char *pg_escape_string_value(const char *value)
 
     size_t len = strlen(value);
     char *escaped = malloc(len * 2 + 1);
-    PQescapeStringConn(conn, escaped, value, len, NULL);
+    if (!escaped)
+        return NULL;
+    int error = 0;
+    PQescapeStringConn(conn, escaped, value, len, &error);
+    if (error)
+    {
+        free(escaped);
+        return NULL;
+    }
     return escaped;
 }
 
@@ -953,8 +998,18 @@ int db_store_resource(cJSON *obj, char *uri)
         started_tx = 1;
     }
 
-    sql = malloc(4096);
-    sql[0] = '\0';
+    char *serialized = cJSON_PrintUnformatted(obj);
+    size_t sql_cap = 8192 + (serialized ? strlen(serialized) * 4 : 0) + (uri ? strlen(uri) * 2 : 0);
+    free(serialized);
+    sql = calloc(sql_cap, 1);
+    if (!sql) {
+        if (started_tx) {
+            res = PQexec(conn, "ROLLBACK");
+            PQclear(res);
+        }
+        pg_unlock();
+        return -1;
+    }
     strcat(sql, "WITH ins AS (INSERT INTO general (");
     for (int i = 0; i < general_cnt; i++) {
         strcat(sql, cJSON_GetArrayItem(GENERAL_ATTR, i)->string);
@@ -1038,8 +1093,10 @@ int db_store_resource(cJSON *obj, char *uri)
         logger("DB", LOG_LEVEL_ERROR, "Failed SQL was: %s", sql);
         PQclear(res);
         free(sql);
-        if (started_tx)
-            PQexec(conn, "ROLLBACK");
+        if (started_tx) {
+            res = PQexec(conn, "ROLLBACK");
+            PQclear(res);
+        }
         pg_unlock();
         return -1;
     }
@@ -1077,7 +1134,7 @@ int db_update_resource(cJSON *obj, char *ri, ResourceType ty)
     int started_tx = 0;
     if (!conn) {
         pg_unlock();
-        return 0;
+        return -1;
     }
 
     // Begin transaction
@@ -1093,7 +1150,18 @@ int db_update_resource(cJSON *obj, char *ri, ResourceType ty)
         started_tx = 1;
     }
 
-    sql = malloc(2048);
+    char *serialized = cJSON_PrintUnformatted(obj);
+    size_t sql_cap = 4096 + (serialized ? strlen(serialized) * 4 : 0) + (ri ? strlen(ri) * 2 : 0);
+    free(serialized);
+    sql = calloc(sql_cap, 1);
+    if (!sql) {
+        if (started_tx) {
+            res = PQexec(conn, "ROLLBACK");
+            PQclear(res);
+        }
+        pg_unlock();
+        return 0;
+    }
     int has_general_updates = 0;
     
     // Build UPDATE statement for general table
@@ -1133,12 +1201,16 @@ int db_update_resource(cJSON *obj, char *ri, ResourceType ty)
         free(escaped_ri);
 
         res = PQexec(conn, sql);
-        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-            logger("DB", LOG_LEVEL_ERROR, "Failed to update general table: %s", PQerrorMessage(conn));
+        if (!res || PQresultStatus(res) != PGRES_COMMAND_OK ||
+            strtol(PQcmdTuples(res), NULL, 10) != 1) {
+            logger("DB", LOG_LEVEL_ERROR, "Failed to update general table: %s",
+                   PQerrorMessage(conn));
             PQclear(res);
             free(sql);
-            if (started_tx)
-                PQexec(conn, "ROLLBACK");
+            if (started_tx) {
+                res = PQexec(conn, "ROLLBACK");
+                PQclear(res);
+            }
             pg_unlock();
             return 0;
         }
@@ -1186,12 +1258,15 @@ int db_update_resource(cJSON *obj, char *ri, ResourceType ty)
         free(escaped_ri);
 
         res = PQexec(conn, sql);
-        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        if (!res || PQresultStatus(res) != PGRES_COMMAND_OK ||
+            strtol(PQcmdTuples(res), NULL, 10) != 1) {
             logger("DB", LOG_LEVEL_ERROR, "Failed to update %s table: %s", get_table_name(ty), PQerrorMessage(conn));
             PQclear(res);
             free(sql);
-            if (started_tx)
-                PQexec(conn, "ROLLBACK");
+            if (started_tx) {
+                res = PQexec(conn, "ROLLBACK");
+                PQclear(res);
+            }
             pg_unlock();
             return 0;
         }
@@ -1236,12 +1311,19 @@ int db_delete_onem2m_resource(RTNode *rtnode)
 
     char *escaped_uri = pg_escape_string_value(get_uri_rtnode(rtnode));
     char *escaped_ri = pg_escape_string_value(ri);
+    if (!escaped_uri || !escaped_ri) {
+        free(escaped_uri);
+        free(escaped_ri);
+        pg_unlock();
+        return 0;
+    }
     
     sprintf(sql, "DELETE FROM general WHERE uri LIKE '%s/%%' OR ri='%s';", escaped_uri, escaped_ri);
     logger("DB", LOG_LEVEL_DEBUG, "SQL : %s", sql);
     
     res = PQexec(conn, sql);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    if (!res || PQresultStatus(res) != PGRES_COMMAND_OK ||
+        strtol(PQcmdTuples(res), NULL, 10) < 1) {
         logger("DB", LOG_LEVEL_ERROR, "Cannot delete resource: %s", PQerrorMessage(conn));
         PQclear(res);
         free(escaped_uri);
@@ -1284,6 +1366,10 @@ int db_delete_one_cin_mni(RTNode *cnt)
     }
 
     char *escaped_cnt_ri = pg_escape_string_value(cnt_ri);
+    if (!escaped_cnt_ri) {
+        pg_unlock();
+        return -1;
+    }
     
     // Find the oldest CIN (lowest lt value) under this CNT
     sprintf(sql, "SELECT general.ri, cin.cs FROM general, cin WHERE general.pi='%s' AND general.id = cin.id ORDER BY general.lt ASC LIMIT 1;", escaped_cnt_ri);
@@ -1302,7 +1388,7 @@ int db_delete_one_cin_mni(RTNode *cnt)
         PQclear(res);
         free(escaped_cnt_ri);
         pg_unlock();
-        return 0;
+        return -1;
     }
 
     // Get the RI and CS of the oldest CIN
@@ -1314,9 +1400,20 @@ int db_delete_one_cin_mni(RTNode *cnt)
     // Create a copy of latest_ri since PQclear will free the result
     char *ri_copy = strdup(latest_ri);
     PQclear(res);
+    if (!ri_copy) {
+        free(escaped_cnt_ri);
+        pg_unlock();
+        return -1;
+    }
 
     // Delete the oldest CIN resource from general table (cascade will handle cin table)
     char *escaped_ri = pg_escape_string_value(ri_copy);
+    if (!escaped_ri) {
+        free(escaped_cnt_ri);
+        free(ri_copy);
+        pg_unlock();
+        return -1;
+    }
     sprintf(sql, "DELETE FROM general WHERE ri='%s';", escaped_ri);
     
     res = PQexec(conn, sql);
@@ -1762,8 +1859,9 @@ static void fc_to_query(char *buf, int buf_size, const char* col, FcOp op, cJSON
 static const char *get_detail_cols(int ty);
 static bool has_res_specific_fc(cJSON *fc);
 static bool fc_needs_ty(int ty, int res_attrs[], int res_attrs_len);
-static int append_general_fc(oneM2MPrimitive *o2pt, char *sql, cJSON *fc, const char *esc_uri, bool is_discover);
-static void append_forbidden(oneM2MPrimitive *o2pt, char *sql, cJSON *fc);
+static int append_general_fc(oneM2MPrimitive *o2pt, char *sql, cJSON *fc, const char *esc_uri,
+                             bool is_discover, cJSON *acpi_list, cJSON *ops_acpi_list);
+static void append_forbidden(char *sql, cJSON *fc, cJSON *acpi_list, cJSON *ops_acpi_list);
 static void append_res_fc(char *sql, cJSON *fc, int *res_attrs, int res_attrs_cnt, int and_flag);
 static cJSON *row_to_cjson_object(PGresult *res, int row);
 static int get_res_specific_fc_attrs(cJSON *fc, int *out_attrs);
@@ -1845,28 +1943,48 @@ cJSON *db_get_descendants(oneM2MPrimitive *o2pt, RTNode *target_node, bool is_di
     // 여기 fc 없는지 제대로 체크(없다의 기준이 fu 같은 값은 없는거랑 마찬가지임)
     if (!fc) return result;
 
-    char *uri = target_node->uri;
-
-    // append_forbidden below walks the shared tree; hold main_lock (before pool)
+    char *uri = NULL;
+    cJSON *acpi_list = NULL;
+    cJSON *ops_acpi_list = NULL;
+    // Snapshot tree-owned inputs before checking out a DB connection.
 #if MONO_THREAD == 0
     pthread_mutex_lock(&main_lock);
 #endif
+    if (target_node && target_node->uri)
+        uri = strdup(target_node->uri);
+    if (is_discover && !cJSON_GetObjectItem(fc, "arp"))
+    {
+        acpi_list = getNonDiscoverableAcp(o2pt, rt->cb);
+        cJSON *ops = cJSON_GetObjectItem(fc, "ops");
+        if (cJSON_IsNumber(ops))
+            ops_acpi_list = getNoPermAcopDiscovery(o2pt, rt->cb, ops->valueint);
+    }
+#if MONO_THREAD == 0
+    pthread_mutex_unlock(&main_lock);
+#endif
+    if (!uri)
+    {
+        cJSON_Delete(acpi_list);
+        cJSON_Delete(ops_acpi_list);
+        return result;
+    }
+
     pg_lock();
     PGconn *conn = get_pg_conn();
     if (!conn) {
         pg_unlock();
-#if MONO_THREAD == 0
-        pthread_mutex_unlock(&main_lock);
-#endif
+        free(uri);
+        cJSON_Delete(acpi_list);
+        cJSON_Delete(ops_acpi_list);
         return result;
     }
 
     char *esc_uri = pg_escape_string_value(uri);
     if (!esc_uri) {
         pg_unlock();
-#if MONO_THREAD == 0
-        pthread_mutex_unlock(&main_lock);
-#endif
+        free(uri);
+        cJSON_Delete(acpi_list);
+        cJSON_Delete(ops_acpi_list);
         return result;
     }
     
@@ -1886,7 +2004,8 @@ cJSON *db_get_descendants(oneM2MPrimitive *o2pt, RTNode *target_node, bool is_di
     }
     const char *sort_dir = (DEFAULT_DISCOVERY_SORT == SORT_DESC) ? "DESC" : "ASC";
     
-    int and_flag = append_general_fc(o2pt, general_where_buf, fc, esc_uri, is_discover); // general fc 추가.
+    int and_flag = append_general_fc(o2pt, general_where_buf, fc, esc_uri, is_discover,
+                                     acpi_list, ops_acpi_list); // general fc 추가.
 
     PGresult *res;
     // join X 참조 반환
@@ -2071,10 +2190,10 @@ cJSON *db_get_descendants(oneM2MPrimitive *o2pt, RTNode *target_node, bool is_di
 
 cleanup:
     free(esc_uri);
+    free(uri);
+    cJSON_Delete(acpi_list);
+    cJSON_Delete(ops_acpi_list);
     pg_unlock();
-#if MONO_THREAD == 0
-    pthread_mutex_unlock(&main_lock);
-#endif
     return result;
 }
 
@@ -2093,27 +2212,54 @@ cJSON *db_get_filter_criteria(oneM2MPrimitive *o2pt)
     cJSON *fc = o2pt->fc;
     cJSON *pjson = NULL, *ptr = NULL;
     cJSON *json = cJSON_CreateArray();
-    // getNonDiscoverableAcp below walks the shared tree; hold main_lock (before pool)
+    char *uri = NULL;
+    cJSON *acpi_list = NULL;
+    cJSON *ops_acpi_list = NULL;
+
+    // Snapshot URI and ACP decisions while the tree is protected, then release
+    // main_lock before waiting for or querying PostgreSQL.
 #if MONO_THREAD == 0
     pthread_mutex_lock(&main_lock);
 #endif
+    const char *tree_uri = o2pt->to;
+    if (strncmp(o2pt->to, CSE_BASE_NAME, strlen(CSE_BASE_NAME)) != 0)
+        tree_uri = ri_to_uri(o2pt->to);
+    if (tree_uri)
+        uri = strdup(tree_uri);
+    acpi_list = getNonDiscoverableAcp(o2pt, rt->cb);
+    cJSON *ops = cJSON_GetObjectItem(fc, "ops");
+    if (cJSON_IsNumber(ops))
+        ops_acpi_list = getNoPermAcopDiscovery(o2pt, rt->cb, ops->valueint);
+#if MONO_THREAD == 0
+    pthread_mutex_unlock(&main_lock);
+#endif
+    if (!uri)
+    {
+        cJSON_Delete(acpi_list);
+        cJSON_Delete(ops_acpi_list);
+        return json;
+    }
+
     pg_lock();
     PGconn *conn = get_pg_conn();
     if (!conn) {
         pg_unlock();
-#if MONO_THREAD == 0
-        pthread_mutex_unlock(&main_lock);
-#endif
+        free(uri);
+        cJSON_Delete(acpi_list);
+        cJSON_Delete(ops_acpi_list);
         return json;
     }
     int fo = cJSON_GetNumberValue(cJSON_GetObjectItem(fc, "fo"));
 
-    char *uri = o2pt->to;
-    if (strncmp(o2pt->to, CSE_BASE_NAME, strlen(CSE_BASE_NAME)) != 0) {
-        uri = ri_to_uri(o2pt->to);
-    }
-
     char *escaped_uri = pg_escape_string_value(uri);
+    if (!escaped_uri)
+    {
+        pg_unlock();
+        free(uri);
+        cJSON_Delete(acpi_list);
+        cJSON_Delete(ops_acpi_list);
+        return json;
+    }
     
     // Build base query
     if (o2pt->drt == DRT_STRUCTURED) {
@@ -2226,8 +2372,7 @@ cJSON *db_get_filter_criteria(oneM2MPrimitive *o2pt)
 
     // Keep PostgreSQL discovery filtering aligned with the SQLite backend:
     // exclude subtrees whose ACPs do not grant discovery privileges.
-    cJSON *acpiList = getNonDiscoverableAcp(o2pt, rt->cb);
-    cJSON *forbiddenURI = getForbiddenUri(acpiList);
+    cJSON *forbiddenURI = getForbiddenUri(acpi_list);
     if (forbiddenURI && cJSON_GetArraySize(forbiddenURI) > 0) {
         int first_forbidden = 1;
         cJSON_ArrayForEach(ptr, forbiddenURI) {
@@ -2249,11 +2394,9 @@ cJSON *db_get_filter_criteria(oneM2MPrimitive *o2pt)
         }
     }
     cJSON_Delete(forbiddenURI);
-    cJSON_Delete(acpiList);
 
     if ((pjson = cJSON_GetObjectItem(fc, "ops"))) {
-        acpiList = getNoPermAcopDiscovery(o2pt, rt->cb, pjson->valueint);
-        forbiddenURI = getForbiddenUri(acpiList);
+        forbiddenURI = getForbiddenUri(ops_acpi_list);
         if (forbiddenURI && cJSON_GetArraySize(forbiddenURI) > 0) {
             int first_forbidden = 1;
             cJSON_ArrayForEach(ptr, forbiddenURI) {
@@ -2275,7 +2418,6 @@ cJSON *db_get_filter_criteria(oneM2MPrimitive *o2pt)
             }
         }
         cJSON_Delete(forbiddenURI);
-        cJSON_Delete(acpiList);
     }
 
     // Add ordering and limit
@@ -2308,9 +2450,9 @@ cJSON *db_get_filter_criteria(oneM2MPrimitive *o2pt)
         PQclear(res);
         free(escaped_uri);
         pg_unlock();
-#if MONO_THREAD == 0
-        pthread_mutex_unlock(&main_lock);
-#endif
+        free(uri);
+        cJSON_Delete(acpi_list);
+        cJSON_Delete(ops_acpi_list);
         return json;
     }
 
@@ -2335,9 +2477,9 @@ cJSON *db_get_filter_criteria(oneM2MPrimitive *o2pt)
     PQclear(res);
     free(escaped_uri);
     pg_unlock();
-#if MONO_THREAD == 0
-    pthread_mutex_unlock(&main_lock);
-#endif
+    free(uri);
+    cJSON_Delete(acpi_list);
+    cJSON_Delete(ops_acpi_list);
     return json;
 }
 
@@ -3410,6 +3552,7 @@ static void fc_to_query(char *buf, int buf_size, const char* col, FcOp op, cJSON
         char *str = val->valuestring;
         if (strlen(val->valuestring) == 0) return; // 빈 문자열은 처리하지 않음
         char *escaped = pg_escape_string_value(str);
+        if (!escaped) return;
         switch (op) {
         case FC_OP_EQ:
             snprintf(buf, buf_size, "%s = '%s'", col, escaped);
@@ -3430,6 +3573,7 @@ static void fc_to_query(char *buf, int buf_size, const char* col, FcOp op, cJSON
             snprintf(buf, buf_size, "%s IS NOT NULL", col);
             break;
         }
+        free(escaped);
      } else if (cJSON_IsNumber(val)) {
         int num = (int)val->valuedouble;
         switch (op) {
@@ -3466,7 +3610,8 @@ static bool fc_needs_ty(int ty, int res_attrs[], int res_attrs_len) {
     return false;
 }
 
-static int append_general_fc(oneM2MPrimitive *o2pt, char *sql, cJSON *fc, const char *esc_uri, bool is_discover) {
+static int append_general_fc(oneM2MPrimitive *o2pt, char *sql, cJSON *fc, const char *esc_uri,
+                             bool is_discover, cJSON *acpi_list, cJSON *ops_acpi_list) {
     char buf[512]; cJSON *p, *ptr;
 
     int and_flag = 1;
@@ -3476,7 +3621,7 @@ static int append_general_fc(oneM2MPrimitive *o2pt, char *sql, cJSON *fc, const 
     snprintf(buf, sizeof(buf), "WHERE uri LIKE '%s/%%'", esc_uri); // uri prefix 설정
     strcat(sql, buf);
     if (is_discover && cJSON_GetObjectItem(fc, "arp") == NULL) {
-        append_forbidden(o2pt, sql, fc);
+        append_forbidden(sql, fc, acpi_list, ops_acpi_list);
     }
     if (cJSON_GetObjectItem(fc, "arp")) {
         cJSON_DeleteItemFromObject(fc, "arp");
@@ -3557,7 +3702,7 @@ static void append_res_fc(char *sql, cJSON *fc, int *res_attrs, int res_attrs_cn
     FilterOperation fo_op = cJSON_GetNumberValue(cJSON_GetObjectItem(fc, "fo"));
     const char *fo_ops[4] = {"","AND", "OR", "XOR"};
 
-    int *needed_res_attrs = malloc(sizeof(int)*res_attrs_cnt);
+    int needed_res_attrs[RES_FC_MAP_LEN];
     int needed_res_attrs_cnt = 0;
 
     for (int i = 0; i < res_attrs_cnt; i++) {
@@ -3595,7 +3740,7 @@ static void append_res_fc(char *sql, cJSON *fc, int *res_attrs, int res_attrs_cn
             // "con 연산자는 와일드 카드 *을 지원"
             if (!strcmp(attr, "con")) {
                 char *str = cJSON_GetStringValue(val);
-                for (int i = 0; i < str[i] != '\0'; i++) {
+                for (int i = 0; str && str[i] != '\0'; i++) {
                     if (str[i] == '*') str[i] = '%';
                 }
                 op = FC_OP_CONTAINS;
@@ -3608,18 +3753,15 @@ static void append_res_fc(char *sql, cJSON *fc, int *res_attrs, int res_attrs_cn
     if (!and_flag) {
         strcat(sql, ")");
     }
-
-    free(needed_res_attrs);
     return;
 }
 
-static void append_forbidden(oneM2MPrimitive *o2pt, char *sql, cJSON *fc) {
+static void append_forbidden(char *sql, cJSON *fc, cJSON *acpi_list, cJSON *ops_acpi_list) {
     // Keep PostgreSQL discovery filtering aligned with the SQLite backend:
     // exclude subtrees whose ACPs do not grant discovery privileges.
     char buf[512];
     cJSON *ptr, *pjson;
-    cJSON *acpiList = getNonDiscoverableAcp(o2pt, rt->cb);
-    cJSON *forbiddenURI = getForbiddenUri(acpiList);
+    cJSON *forbiddenURI = getForbiddenUri(acpi_list);
     if (forbiddenURI && cJSON_GetArraySize(forbiddenURI) > 0) {
         int first_forbidden = 1;
         cJSON_ArrayForEach(ptr, forbiddenURI) {
@@ -3641,11 +3783,9 @@ static void append_forbidden(oneM2MPrimitive *o2pt, char *sql, cJSON *fc) {
         }
     }
     cJSON_Delete(forbiddenURI);
-    cJSON_Delete(acpiList);
 
     if ((pjson = cJSON_GetObjectItem(fc, "ops"))) {
-        acpiList = getNoPermAcopDiscovery(o2pt, rt->cb, pjson->valueint);
-        forbiddenURI = getForbiddenUri(acpiList);
+        forbiddenURI = getForbiddenUri(ops_acpi_list);
         if (forbiddenURI && cJSON_GetArraySize(forbiddenURI) > 0) {
             int first_forbidden = 1;
             cJSON_ArrayForEach(ptr, forbiddenURI) {
@@ -3667,7 +3807,6 @@ static void append_forbidden(oneM2MPrimitive *o2pt, char *sql, cJSON *fc) {
             }
         }
         cJSON_Delete(forbiddenURI);
-        cJSON_Delete(acpiList);
     }
 }
 
@@ -3733,9 +3872,9 @@ static int get_res_specific_fc_attrs(cJSON *fc, int *out_attrs) {
 }
 
 // boot-time recount of a CNT's counters from actual child CIN rows
-int db_cnt_recount(char *cnt_ri, int *cni, long *cbs)
+int db_cnt_recount(char *cnt_ri, int *cni, long *cbs, int *max_st)
 {
-    if (!cnt_ri || !cni || !cbs)
+    if (!cnt_ri || !cni || !cbs || !max_st)
         return 0;
     char sql[512] = {0};
     PGresult *res;
@@ -3747,7 +3886,7 @@ int db_cnt_recount(char *cnt_ri, int *cni, long *cbs)
         return 0;
     }
     char *ri = pg_escape_string_value(cnt_ri);
-    sprintf(sql, "SELECT COUNT(*), COALESCE(SUM(c.cs),0) FROM general g "
+    sprintf(sql, "SELECT COUNT(*), COALESCE(SUM(c.cs),0), COALESCE(MAX(c.st),-1) FROM general g "
                  "JOIN cin c ON c.id = g.id WHERE g.pi='%s' AND g.ty=4;", ri);
     res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK)
@@ -3760,6 +3899,7 @@ int db_cnt_recount(char *cnt_ri, int *cni, long *cbs)
     }
     *cni = atoi(PQgetvalue(res, 0, 0));
     *cbs = atol(PQgetvalue(res, 0, 1));
+    *max_st = atoi(PQgetvalue(res, 0, 2));
     PQclear(res);
     free(ri);
     pg_unlock();
