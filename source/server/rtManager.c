@@ -317,10 +317,13 @@ RTNode *find_rtnode(char *addr)
 /**
  * @brief get resource from remote cse with sp-relative uri
  * @param address sp-relative address
+ * @param originator From to use on the forwarded RETRIEVE. Pass the real
+ *        requester's ID so the remote hosting CSE evaluates its ACP against
+ *        that identity; NULL/empty falls back to this CSE's CSE-ID.
  * @return RTNode or NULL
  * @remark rtnode should be freed after use
  */
-RTNode *get_remote_resource(char *address, int *rsc)
+RTNode *get_remote_resource(char *address, char *originator, int *rsc)
 {
     if (!address)
         return NULL;
@@ -331,10 +334,13 @@ RTNode *get_remote_resource(char *address, int *rsc)
     RTNode *csr = find_csr_rtnode_by_uri(target_uri);
 
     if (!csr)
+    {
+        free(target_uri);
         return NULL;
+    }
 
     oneM2MPrimitive *o2pt = (oneM2MPrimitive *)calloc(1, sizeof(oneM2MPrimitive));
-    o2pt->fr = strdup("/" CSE_BASE_RI);
+    o2pt->fr = strdup((originator && originator[0]) ? originator : "/" CSE_BASE_RI);
     o2pt->to = strdup(target_uri);
     o2pt->op = OP_RETRIEVE;
     o2pt->rqi = strdup("retrieve remote resource");
@@ -344,6 +350,7 @@ RTNode *get_remote_resource(char *address, int *rsc)
     *rsc = o2pt->rsc;
     if (*rsc != RSC_OK)
     {
+        free(target_uri);
         free_o2pt(o2pt);
         return NULL;
     }
@@ -352,6 +359,7 @@ RTNode *get_remote_resource(char *address, int *rsc)
     RTNode *rtnode = create_rtnode(cJSON_Duplicate(resource, 1), ty);
     rtnode->uri = strdup(target_uri);
 
+    free(target_uri);
     free_o2pt(o2pt);
     return rtnode;
 }

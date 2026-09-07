@@ -1287,7 +1287,7 @@ int fopt_onem2m_resource(oneM2MPrimitive *o2pt, RTNode *parent_rtnode)
             }
             else
             {
-				target_rtnode = get_remote_resource(memberReq->to, &rsc);
+				target_rtnode = get_remote_resource(memberReq->to, memberReq->fr, &rsc);
                 if (!target_rtnode)
                 {
 					memberReq->rsc = rsc;

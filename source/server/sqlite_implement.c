@@ -162,7 +162,12 @@ static const table_def_t table_definitions[] = {
      "cst INT, csi VARCHAR(45), srt VARCHAR(100), poa VARCHAR(200), nl VARCHAR(45), ncp VARCHAR(45), srv VARCHAR(45), rr INT, at VARCHAR(200), aa VARCHAR(100), ast INT, "
      "CONSTRAINT fk_id FOREIGN KEY (id) REFERENCES general(id) ON DELETE CASCADE );"
     },
-    {"cbA", 
+    {"acpA",
+     "CREATE TABLE IF NOT EXISTS acpA ( id INTEGER, "
+     "lnk VARCHAR(100), pv VARCHAR(255), pvs VARCHAR(100), ast INT, "
+     "CONSTRAINT fk_id FOREIGN KEY (id) REFERENCES general(id) ON DELETE CASCADE );"
+    },
+    {"cbA",
      "CREATE TABLE IF NOT EXISTS cbA ( id INTEGER, "
      "cst INT, lnk VARCHAR(100), csi VARCHAR(45), srt VARCHAR(100), poa VARCHAR(200), nl VARCHAR(45), ncp VARCHAR(45), srv VARCHAR(45), rr INT, "
      "at VARCHAR(200), aa VARCHAR(100), ast INT, "
@@ -365,6 +370,9 @@ char *get_table_name(ResourceType ty)
         break;
     case RT_CSR:
         tableName = "csr";
+        break;
+    case RT_ACPA:
+        tableName = "acpA";
         break;
     case RT_AEA:
         tableName = "aeA";

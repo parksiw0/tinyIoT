@@ -163,6 +163,9 @@ ResourceType http_parse_object_type(header_t* headers)
 	case 30:
 		ty = RT_TSI;
 		break;
+	case 10001:
+		ty = RT_ACPA;
+		break;
 	case 10002:
 		ty = RT_AEA;
 		break;
@@ -407,6 +410,8 @@ ResourceType parse_object_type_cjson(cJSON* cjson)
 		ty = RT_CINA;
 	else if (cJSON_GetObjectItem(cjson, "m2m:fcnt"))
 		ty = RT_FCNT;
+	else if (cJSON_GetObjectItem(cjson, "m2m:acpa"))
+		ty = RT_ACPA;
 	else
 	{
 		ty = RT_MIXED;
@@ -474,6 +479,9 @@ char* resource_identifier(ResourceType ty, char* ct)
 		break;
 	case RT_CSR:
 		strcpy(ri, "16-");
+		break;
+	case RT_ACPA:
+		strcpy(ri, "10001-");
 		break;
 	case RT_CBA:
 		strcpy(ri, "10005-");
@@ -2372,26 +2380,32 @@ int make_response_body(oneM2MPrimitive* o2pt, RTNode* target_rtnode)
 #endif
 		break;
 	case RCN_ORIGINAL_RESOURCE:
-		if (target_rtnode->ty < 10000)
+	{
+		// announced resource types live in [10000, 20000); virtual resources
+		// (RT_FCNT_LA/OL = 2005x) are >= 20000 and are not announced.
+		if (target_rtnode->ty < 10000 || target_rtnode->ty >= 20000)
 		{
-			handle_error(o2pt, RSC_BAD_REQUEST, "rcn 7 is not supported for non anncounced resources");
-			break;
+			cJSON_Delete(root);
+			return handle_error(o2pt, RSC_BAD_REQUEST, "rcn 7 is not supported for non announced resources");
 		}
-
-		remote = get_remote_resource(cJSON_GetObjectItem(target_rtnode->obj, "lnk")->valuestring, &rsc);
-		// logger("UTIL", LOG_LEVEL_DEBUG, "make_response_body : %s", cJSON_GetObjectItem(target_rtnode->obj, "lnk")->valuestring);
-		if (remote && rsc == RSC_OK)
+		cJSON *lnk = cJSON_GetObjectItem(target_rtnode->obj, "lnk");
+		if (!lnk || !cJSON_IsString(lnk) || !lnk->valuestring)
 		{
-			// logger("UTIL", LOG_LEVEL_DEBUG, "make_response_body : %s", remote->uri);
-			cJSON_AddItemToObject(root, get_resource_key(remote->ty), cJSON_Duplicate(remote->obj, true));
-			free_rtnode(remote);
+			cJSON_Delete(root);
+			return handle_error(o2pt, RSC_NOT_FOUND, "announced resource has no lnk");
 		}
-		else
+		rsc = RSC_NOT_FOUND;
+		remote = get_remote_resource(lnk->valuestring, o2pt->fr, &rsc);
+		if (!remote || rsc != RSC_OK)
 		{
+			if (remote) free_rtnode(remote);
 			cJSON_Delete(root);
 			return handle_error(o2pt, rsc, "original resource is not reachable");
 		}
+		cJSON_AddItemToObject(root, get_resource_key(remote->ty), cJSON_Duplicate(remote->obj, true));
+		free_rtnode(remote);
 		break;
+	}
 	case RCN_CHILD_RESOURCES:
 #if MONO_THREAD == 0
 		pthread_mutex_lock(&main_lock);
@@ -2558,16 +2572,36 @@ int make_response_body_retrieve(oneM2MPrimitive* o2pt, RTNode* target_rtnode, cJ
 		cJSON_AddItemToObject(rrf, "rrf", descendant_arr);
 		cJSON_AddItemToObject(root, "m2m:rrl", rrf);
 		break;
-	// 7
+	// 7 - follow `lnk` and return the original (non-announced) resource
 	case RCN_ORIGINAL_RESOURCE:
-	// 추후에 확인 필요.
-		if (target_rtnode->ty < 10000)
+	{
+		// announced types are in [10000, 20000); virtual resources (2005x) are not announced
+		if (target_rtnode->ty < 10000 || target_rtnode->ty >= 20000)
 		{
-			handle_error(o2pt, RSC_BAD_REQUEST, "rcn 7 is not supported for non anncounced resources");
-			break;
+			if (target_obj) cJSON_Delete(target_obj);
+			cJSON_Delete(root);
+			return handle_error(o2pt, RSC_BAD_REQUEST, "rcn 7 is not supported for non announced resources");
 		}
-		cJSON_AddItemToObject(root, target_key, target_obj);
+		cJSON *lnk = cJSON_GetObjectItem(target_rtnode->obj, "lnk");
+		if (!lnk || !cJSON_IsString(lnk) || !lnk->valuestring)
+		{
+			if (target_obj) cJSON_Delete(target_obj);
+			cJSON_Delete(root);
+			return handle_error(o2pt, RSC_NOT_FOUND, "announced resource has no lnk");
+		}
+		int orsc = RSC_NOT_FOUND;
+		RTNode *orig = get_remote_resource(lnk->valuestring, o2pt->fr, &orsc);
+		if (target_obj) cJSON_Delete(target_obj);
+		if (!orig || orsc != RSC_OK)
+		{
+			if (orig) free_rtnode(orig);
+			cJSON_Delete(root);
+			return handle_error(o2pt, orsc, "original resource is not reachable");
+		}
+		cJSON_AddItemToObject(root, get_resource_key(orig->ty), cJSON_Duplicate(orig->obj, true));
+		free_rtnode(orig);
 		break;
+	}
 	// 8
 	case RCN_CHILD_RESOURCES:
 		if (target_obj) {
@@ -4656,12 +4690,15 @@ int create_remote_cba(char* poa, char** cbA_url)
 
 		cJSON* root = cJSON_CreateObject();
 		cJSON* cba = cJSON_CreateObject();
-		cJSON_AddItemToObject(root, get_resource_key(RT_CBA), cba);
-		cJSON_AddStringToObject(cba, "rn", cba_rn);
+		cJSON_AddItemToObject(root, get_resource_key(RT_CBA), cba); 
+
+		// TODO(rel5): confirm which attributes are actually allowed in the
+		// <CSEBaseAnnc> create payload against oneM2M Release 5
+		// cJSON_AddStringToObject(cba, "rn", cba_rn);
+		
 		cJSON_AddItemToObject(cba, "lnk", cJSON_CreateString("/" CSE_BASE_RI "/" CSE_BASE_NAME));
 		cJSON* srv = cJSON_Duplicate(cJSON_GetObjectItem(rt->cb->obj, "srv"), true);
 		cJSON_AddItemToObject(cba, "srv", srv);
-		// CSEBase has no expirationTime; synthesise one so <CSEBaseAnnc> carries the MA `et`.
 		char* cba_et = get_local_time(DEFAULT_EXPIRE_TIME);
 		cJSON_AddStringToObject(cba, "et", cba_et);
 		free(cba_et);

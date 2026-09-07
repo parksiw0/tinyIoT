@@ -53,10 +53,15 @@ int create_ts(oneM2MPrimitive *o2pt, RTNode *parent_rtnode) {
     if (validate_ts(o2pt, ts, OP_CREATE) != RSC_OK) { cJSON_Delete(root); return o2pt->rsc; }
 
     cJSON *pei_item = cJSON_GetObjectItem(ts, "pei");
-    if (!pei_item) pei_item = cJSON_AddNumberToObject(ts, "pei", 0);
-    if (!cJSON_GetObjectItem(ts, "peid")) {
-        if (pei_item->valueint > 0) cJSON_AddNumberToObject(ts, "peid", pei_item->valueint / 2);
-    } else if (pei_item->valueint <= 0) cJSON_DeleteItemFromObject(ts, "peid");
+    if (pei_item && (!cJSON_IsNumber(pei_item) || pei_item->valueint <= 0)) {
+        cJSON_DeleteItemFromObject(ts, "pei");
+        pei_item = NULL;
+    }
+    if (!pei_item) {
+        cJSON_DeleteItemFromObject(ts, "peid");           // peid without pei is meaningless
+    } else if (!cJSON_GetObjectItem(ts, "peid")) {
+        cJSON_AddNumberToObject(ts, "peid", pei_item->valueint / 2);
+    }
 
     if (!cJSON_GetObjectItem(ts, "mdd")) cJSON_AddBoolToObject(ts, "mdd", false);
     cJSON *req_mdd = cJSON_GetObjectItem(ts, "mdd");
@@ -205,12 +210,18 @@ int update_ts(oneM2MPrimitive *o2pt, RTNode *target_rtnode) {
 
     double new_pei = -1.0;
     double new_peid = -1.0;
-    
+
     cJSON *item_pei = cJSON_GetObjectItem(ts, "pei");
+    if (item_pei && cJSON_IsNumber(item_pei) && cJSON_GetNumberValue(item_pei) <= 0) {
+        cJSON_ReplaceItemInObject(ts, "pei", cJSON_CreateNull());
+        if (!cJSON_GetObjectItem(ts, "peid"))
+            cJSON_AddItemToObject(ts, "peid", cJSON_CreateNull());
+        item_pei = NULL;
+    }
     if (item_pei) new_pei = cJSON_GetNumberValue(item_pei);
 
     cJSON *item_peid = cJSON_GetObjectItem(ts, "peid");
-    if (item_peid) new_peid = cJSON_GetNumberValue(item_peid);
+    if (item_peid && cJSON_IsNumber(item_peid)) new_peid = cJSON_GetNumberValue(item_peid);
 
     if (new_pei != -1.0 && new_peid == -1.0) {
         double calc_peid = new_pei / 2.0;

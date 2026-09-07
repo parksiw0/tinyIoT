@@ -34,7 +34,7 @@ void update_resource(cJSON* old_obj, cJSON* new_obj);
 int parsePoa(char* poa_str, Protocol* prot, char** host, int* port, char** path);
 RTNode* get_rtnode(oneM2MPrimitive* o2pt);
 RTNode* parse_uri(oneM2MPrimitive* o2pt, RTNode* cb);
-RTNode* get_remote_resource(char* address, int* rsc);
+RTNode* get_remote_resource(char* address, char* originator, int* rsc);
 
 cJSON* getNonDiscoverableAcp(oneM2MPrimitive* o2pt, RTNode* rtnode);
 cJSON* getNoPermAcopDiscovery(oneM2MPrimitive* o2pt, RTNode* rtnode, ACOP acop);

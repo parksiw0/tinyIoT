@@ -260,7 +260,12 @@ static const table_def_t table_definitions[] = {
      "spi VARCHAR(45), "
      "CONSTRAINT fk_id FOREIGN KEY (id) REFERENCES general(id) ON DELETE CASCADE );"
     },
-    {"cbA", 
+    {"acpA",
+     "CREATE TABLE IF NOT EXISTS acpA ( id INTEGER, "
+     "lnk VARCHAR(100), pv VARCHAR(255), pvs VARCHAR(100), ast INT, "
+     "CONSTRAINT fk_id FOREIGN KEY (id) REFERENCES general(id) ON DELETE CASCADE );"
+    },
+    {"cbA",
      "CREATE TABLE IF NOT EXISTS cbA ( id INTEGER, "
      "cst INT, lnk VARCHAR(100), csi VARCHAR(45), srt VARCHAR(100), poa VARCHAR(200), nl VARCHAR(45), ncp VARCHAR(45), srv VARCHAR(45), rr INT, "
      "at VARCHAR(200), aa VARCHAR(100), ast INT, "
@@ -370,7 +375,12 @@ static const table_def_t table_definitions[] = {
      "spi TEXT, "
      "CONSTRAINT fk_id FOREIGN KEY (id) REFERENCES general(id) ON DELETE CASCADE );"
     },
-    {"cbA", 
+    {"acpA",
+     "CREATE TABLE IF NOT EXISTS acpA ( id INTEGER, "
+     "lnk TEXT, pv TEXT, pvs TEXT, ast INT, "
+     "CONSTRAINT fk_id FOREIGN KEY (id) REFERENCES general(id) ON DELETE CASCADE );"
+    },
+    {"cbA",
      "CREATE TABLE IF NOT EXISTS cbA ( id INTEGER, "
      "cst INT, lnk TEXT, csi TEXT, srt TEXT, poa TEXT, nl TEXT, ncp TEXT, srv TEXT, rr INT, "
      "at TEXT, aa TEXT, ast INT, "
@@ -605,6 +615,9 @@ char *get_table_name(ResourceType ty)
         break;
     case RT_CSR:
         tableName = "csr";
+        break;
+    case RT_ACPA:
+        tableName = "acpA";
         break;
     case RT_AEA:
         tableName = "aeA";
@@ -1805,6 +1818,16 @@ static const ResFcMap RES_FC_MAP[] = {
     /* acp */
     {"pv",   RT_ACP,  "pv",   FC_OP_EXISTS},
     {"pvs",  RT_ACP,  "pvs",  FC_OP_EXISTS},
+
+    /* annc */
+    {"lnk", RT_ACPA, "lnk", FC_OP_EQ},
+    {"lnk", RT_AEA, "lnk", FC_OP_EQ},
+    {"lnk", RT_CNTA, "lnk", FC_OP_EQ},
+    {"lnk", RT_CINA, "lnk", FC_OP_EQ},
+    {"lnk", RT_CBA, "lnk", FC_OP_EQ},
+    {"lnk", RT_GRPA, "lnk", FC_OP_EQ},
+    {"lnk", RT_FCNTA, "lnk", FC_OP_EQ},
+    {"lnk", RT_TSA, "lnk", FC_OP_EQ},
 };
 #define RES_FC_MAP_LEN (int)(sizeof(RES_FC_MAP) / sizeof(ResFcMap))
 #define RES_DETAIL_COLS_LEN (int)(sizeof(RES_DETAIL_COLS) / sizeof(ResDetailCols))
@@ -3499,7 +3522,7 @@ static void append_res_fc(char *sql, cJSON *fc, int *res_attrs, int res_attrs_cn
 
         if ((val = cJSON_GetObjectItem(fc, attr))) {
             // "con 연산자는 와일드 카드 *을 지원"
-            if (!strcmp(attr, "con")) {
+            if (!strcmp(attr, "con") || !strcmp(attr, "lnk")) {
                 char *str = cJSON_GetStringValue(val);
                 for (int i = 0; i < str[i] != '\0'; i++) {
                     if (str[i] == '*') str[i] = '%';
