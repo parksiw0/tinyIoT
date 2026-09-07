@@ -1,0 +1,18 @@
+// Release 2 genericInterworkingService specialization used by TS-0004 tests
+
+[
+    {
+        "type"  : "m2m:gis",
+        "lname" : "genericInterworkingService",
+        "cnd"   : "urn:m2m:CDT-gis-v2_21_0.xsd",
+        "attributes" : [
+            { "sname" : "gisn", "lname" : "serviceName",          "type" : "string", "car" : "01", "oc" : "M", "ou" : "NP", "od" : "O", "annc" : "OA" },
+            { "sname" : "giip", "lname" : "inputDataPointLinks",  "type" : "list",   "car" : "01", "oc" : "O", "ou" : "O",  "od" : "O", "annc" : "OA" },
+            { "sname" : "giop", "lname" : "outputDataPointLinks", "type" : "list",   "car" : "01", "oc" : "O", "ou" : "O",  "od" : "O", "annc" : "OA" }
+        ],
+        "children" : [
+            "m2m:gis",
+            "m2m:gio"
+        ]
+    }
+]
