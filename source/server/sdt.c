@@ -291,6 +291,21 @@ SDTDef* sdt_find_by_cnd(const char *cnd) {
     return NULL;
 }
 
+SDTDef* sdt_find_by_type_and_cnd(const char *type, const char *cnd) {
+    if (!g_sdt || !type || !cnd) return NULL;
+
+    /* Several schema versions may share a shortname. Match both identifiers
+     * so that directory enumeration order cannot select a different schema. */
+    for (int i = 0; i < g_sdt->count; i++) {
+        SDTDef *def = g_sdt->defs[i];
+        if (def->type && def->cnd && strcmp(def->type, type) == 0 &&
+            strcmp(def->cnd, cnd) == 0) {
+            return def;
+        }
+    }
+    return NULL;
+}
+
 static int is_valid_timestamp(const char *s) {
     if (!s || strlen(s) < 15) return 0;
     // yyyyMMddTHHmmss (basic) or yyyy-MM-ddTHH:mm:ss (extended)
@@ -539,7 +554,10 @@ int sdt_validate_fcnt(const char *shortname, const char *cnd, cJSON *custom_attr
 
     SDTDef *def = NULL;
     if (shortname) {
-        def = sdt_find_by_type(shortname);
+        def = sdt_find_by_type_and_cnd(shortname, cnd);
+        if (!def) {
+            def = sdt_find_by_type(shortname);
+        }
     }
 
     if (!def) {

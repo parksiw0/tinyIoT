@@ -5507,6 +5507,7 @@ cJSON *extract_custom_attributes(cJSON *fcnt)
 int validate_shortname_cnd(const char *shortname, const char *cnd, char **error_msg) {
 	if (!cnd) return RSC_OK;
 	if (!shortname) return RSC_OK;
+	if (sdt_find_by_type_and_cnd(shortname, cnd)) return RSC_OK;
 
 	SDTDef *def = sdt_find_by_type(shortname);
 	if (!def) {
