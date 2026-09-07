@@ -354,7 +354,7 @@ int validate_grp_member(cJSON *grp, cJSON *final_mid, int csy, int mt)
             else
             {
                 logger("UTIL", LOG_LEVEL_DEBUG, "SP RELATIVE REMOTE", tStr);
-                rt_node = get_remote_resource(tStr, &rsc);
+                rt_node = get_remote_resource(tStr, NULL, &rsc);
                 resourceLocation = 2;
                 if (!rt_node)
                 { // error
